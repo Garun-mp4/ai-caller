@@ -1,2 +1,63 @@
-'use client'; import {useEffect,useState} from 'react'; import {api,API} from '@/lib/api';
-export default function Login(){const [u,setU]=useState('admin'),[p,setP]=useState('admin'),[e,setE]=useState(''),[cfg,setCfg]=useState<any>();useEffect(()=>{api('/auth/config').then(setCfg).catch(()=>{});const q=new URLSearchParams(location.search);const t=q.get('token');if(t){localStorage.setItem('token',t);location.href='/' }},[]);async function go(ev:any){ev.preventDefault();setE('');try{const r=await api('/auth/login',{method:'POST',body:JSON.stringify({username:u,password:p})});localStorage.setItem('token',r.access_token);location.href='/'}catch(x:any){setE(x.message)}}const chat=cfg?.mode==='chatgpt';return <div className="min-h-screen grid place-items-center p-4"><div className="card p-6 w-full max-w-sm"><div className="text-xl font-semibold">AI Call Agent</div><div className="muted text-sm mt-1 mb-5">{chat?'Sign in with your ChatGPT account':'Local administrator sign in'}</div>{chat?<>{cfg?.chatgpt_oauth_available?<button className="btn btn-primary w-full" onClick={()=>location.href=API+'/auth/chatgpt/start'}>Continue with ChatGPT</button>:<div className="text-sm text-amber-200">OpenAI OAuth client credentials are not configured. Set OPENAI_OAUTH_CLIENT_ID or switch AUTH_MODE=local.</div>}<p className="muted text-xs mt-4">Website authentication is separate from Codex CLI authentication.</p></>:<form onSubmit={go}><input className="input mb-3" value={u} onChange={x=>setU(x.target.value)} placeholder="Username"/><input className="input mb-3" type="password" value={p} onChange={x=>setP(x.target.value)} placeholder="Password"/>{e&&<div className="text-red-300 text-sm mb-3">{e}</div>}<button className="btn btn-primary w-full">Sign in</button><p className="muted text-xs mt-4">Default dev credentials: admin / admin. Change them in .env.</p></form>}</div></div>}
+'use client';
+
+import { useEffect, useState, type FormEvent } from 'react';
+import { useRouter } from 'next/navigation';
+import { api, API } from '@/lib/api';
+import { friendlyError, Icon, Notice } from '@/components/UI';
+
+type AuthConfig = { mode: string; chatgpt_oauth_available: boolean };
+
+export default function Login() {
+  const router = useRouter();
+  const [username, setUsername] = useState('');
+  const [password, setPassword] = useState('');
+  const [showPassword, setShowPassword] = useState(false);
+  const [error, setError] = useState('');
+  const [config, setConfig] = useState<AuthConfig | null>(null);
+  const [configLoading, setConfigLoading] = useState(true);
+  const [submitting, setSubmitting] = useState(false);
+
+  useEffect(() => {
+    let current = true;
+    api<AuthConfig>('/auth/config').then(result => { if (current) setConfig(result); }).catch(() => { if (current) setConfig(null); }).finally(() => { if (current) setConfigLoading(false); });
+    const token = new URLSearchParams(window.location.search).get('token');
+    if (token) {
+      localStorage.setItem('token', token);
+      window.history.replaceState({}, '', '/login');
+      router.replace('/');
+    }
+    return () => { current = false; };
+  }, [router]);
+
+  async function submit(event: FormEvent<HTMLFormElement>) {
+    event.preventDefault(); setError(''); setSubmitting(true);
+    try {
+      const result = await api<{ access_token: string }>('/auth/login', { method: 'POST', body: JSON.stringify({ username: username.trim(), password }) });
+      localStorage.setItem('token', result.access_token);
+      router.replace('/');
+    } catch (requestError) { setError(friendlyError(requestError)); }
+    finally { setSubmitting(false); }
+  }
+
+  const usesChatGPT = config?.mode === 'chatgpt';
+
+  return <main className="login-screen">
+    <section className="card login-card" aria-labelledby="login-title">
+      <div className="login-logo"><span className="brand-mark"><Icon name="activity"/></span><span>AI Call Agent</span></div>
+      <h1 className="login-heading" id="login-title">{usesChatGPT ? 'Вход в рабочее пространство' : 'Рады видеть вас'}</h1>
+      <p className="login-description">{usesChatGPT ? 'Авторизуйтесь с помощью аккаунта ChatGPT, чтобы продолжить.' : 'Войдите, чтобы работать с лидами и кампаниями.'}</p>
+      {error && <div className="feedback"><Notice tone="danger">{error}</Notice></div>}
+      {configLoading ? <div className="loading-state"><span className="spinner" aria-hidden="true"/>Проверяем способ входа…</div> : usesChatGPT ? <>
+        {config?.chatgpt_oauth_available
+          ? <button type="button" className="btn btn-primary btn-block" onClick={() => window.location.assign(`${API}/auth/chatgpt/start`)}><Icon name="external"/>Продолжить с ChatGPT</button>
+          : <Notice tone="warning">OAuth не настроен на сервере. Добавьте OAuth client ID или переключите AUTH_MODE на local.</Notice>}
+        <p className="login-footnote">Вход в сайт и авторизация в Codex CLI на компьютере — разные механизмы.</p>
+      </> : <form onSubmit={submit}>
+        <label className="field"><span className="field-label">Имя пользователя</span><input className="input" name="username" value={username} onChange={event => setUsername(event.target.value)} autoComplete="username" autoFocus required/></label>
+        <div className="field" style={{ marginTop: 13 }}><label className="field-label" htmlFor="login-password">Пароль</label><span className="password-field"><input id="login-password" className="input" name="password" type={showPassword ? 'text' : 'password'} value={password} onChange={event => setPassword(event.target.value)} autoComplete="current-password" required/><button type="button" className="password-toggle" onClick={() => setShowPassword(value => !value)} aria-label={showPassword ? 'Скрыть пароль' : 'Показать пароль'} aria-pressed={showPassword}>{showPassword ? 'Скрыть' : 'Показать'}</button></span></div>
+        <button type="submit" className="btn btn-primary btn-block" style={{ marginTop: 16 }} disabled={submitting || !username.trim() || !password}>{submitting ? 'Входим…' : 'Войти'}</button>
+        <p className="login-footnote">Учётные данные задаются в конфигурации сервера.</p>
+      </form>}
+    </section>
+  </main>;
+}

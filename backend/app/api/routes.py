@@ -98,7 +98,10 @@ def update_lead(lead_id:int,req:LeadUpdate,db:Session=Depends(get_db)):
     if req.notes is not None: lead.notes=req.notes
     if req.status is not None:
         lead.status=req.status
-        if req.status=="DO_NOT_CALL": lead.next_call_at=None
+        if req.status=="DO_NOT_CALL":
+            lead.next_call_at=None
+            for callback in db.scalars(select(Callback).where(Callback.lead_id==lead_id,Callback.status.in_(["SCHEDULED","DUE"]))).all():
+                callback.status="CANCELED"
     db.commit(); db.refresh(lead); return lead
 
 @router.post("/leads/{lead_id}/callback", response_model=CallbackOut, dependencies=[Depends(require_user)])
@@ -160,7 +163,10 @@ def stop_campaign(campaign_id:int,db:Session=Depends(get_db)):
     c.status="STOPPED"; c.stopped_at=datetime.now(timezone.utc); db.commit(); db.refresh(c); return c
 
 @router.post("/scheduler/tick", dependencies=[Depends(require_user)])
-async def scheduler_tick(): return {"processed":await scheduler.tick(ignore_hours=True)}
+async def scheduler_tick():
+    if S.app_env.casefold() in {"production", "prod"}:
+        raise HTTPException(status_code=403, detail="Manual scheduler tick is available only in development")
+    return {"processed":await scheduler.tick(ignore_hours=True)}
 
 @router.get("/calls", dependencies=[Depends(require_user)])
 def calls(db:Session=Depends(get_db)):
@@ -174,9 +180,41 @@ def callbacks(db:Session=Depends(get_db)):
         lead=db.get(Lead,cb.lead_id); out.append({**CallbackOut.model_validate(cb).model_dump(),"phone":lead.phone if lead else "","company":lead.company if lead else None})
     return out
 
+@router.patch("/callbacks/{callback_id}", response_model=CallbackOut, dependencies=[Depends(require_user)])
+def update_callback(callback_id:int,req:CallbackUpdate,db:Session=Depends(get_db)):
+    callback=db.get(Callback,callback_id)
+    if not callback: raise HTTPException(404,"Callback not found")
+    lead=db.get(Lead,callback.lead_id)
+    if not lead: raise HTTPException(404,"Lead not found")
+    target_status=req.status or callback.status
+    scheduled_at=req.scheduled_at
+    if scheduled_at is not None and scheduled_at.tzinfo is None:
+        scheduled_at=scheduled_at.replace(tzinfo=timezone.utc)
+    if callback.status in ("COMPLETED","CANCELED") and (req.scheduled_at is not None or req.reason is not None or req.status not in (None,callback.status)):
+        raise HTTPException(409,"Callback is already closed")
+    if target_status in ("SCHEDULED","DUE"):
+        if lead.status=="DO_NOT_CALL": raise HTTPException(409,"Lead is DO_NOT_CALL")
+        target_time=scheduled_at or callback.scheduled_at
+        if target_time.tzinfo is None: target_time=target_time.replace(tzinfo=timezone.utc)
+        if target_time<=datetime.now(timezone.utc): raise HTTPException(422,"Callback must be scheduled in the future")
+        callback.scheduled_at=target_time
+        if scheduled_at is not None: callback.status="SCHEDULED"
+    elif scheduled_at is not None:
+        raise HTTPException(422,"Only scheduled callbacks can be rescheduled")
+    if req.reason is not None: callback.reason=req.reason.strip()
+    if req.status is not None: callback.status=req.status
+    if callback.status in ("COMPLETED","CANCELED"):
+        active=db.scalars(select(Callback).where(Callback.lead_id==lead.id,Callback.id!=callback.id,Callback.status.in_(["SCHEDULED","DUE"])).order_by(Callback.scheduled_at)).all()
+        if active and lead.status!="DO_NOT_CALL":
+            lead.status="CALLBACK"; lead.next_call_at=active[0].scheduled_at
+        else:
+            lead.next_call_at=None
+            if lead.status=="CALLBACK": lead.status="DONE" if callback.status=="COMPLETED" else "NEW"
+    db.commit(); db.refresh(callback); return callback
+
 @router.get("/settings", dependencies=[Depends(require_user)])
 def settings(db:Session=Depends(get_db)):
-    defaults={"agent_name":"Alex","company_name":"Web Studio","what_we_sell":"Websites, redesign and web automation","introduction":"Добрый день! Короткий вопрос по вашему сайту.","offer":"Разработка и улучшение сайтов для бизнеса","allowed_claims":"We build websites and automation","forbidden_claims":"Do not invent prices, portfolio, guarantees or deadlines","call_objective":"Identify interest and agree next step","max_response_length":"3","calling_hours":f"{S.calling_hours_start}-{S.calling_hours_end}","timezone":S.app_timezone,"max_attempts":str(S.max_attempts),"delay_between_attempts":str(S.retry_delay_minutes),"max_concurrent_calls":str(S.max_concurrent_calls),"vosk_model_path":S.vosk_model_path,"piper_model_path":S.piper_model_path,"llm_provider":S.llm_provider,"llm_model":S.codex_model,"reasoning_effort":S.codex_reasoning_effort}
+    defaults={"agent_name":"Алекс","company_name":"Веб-студия","what_we_sell":"Разработка сайтов, редизайн и автоматизация для бизнеса","introduction":"Добрый день! Можно задать короткий вопрос о вашем сайте?","offer":"Разработка и улучшение сайтов для бизнеса","allowed_claims":"Мы разрабатываем сайты и автоматизируем процессы.","forbidden_claims":"Не придумывать цены, кейсы, гарантии и сроки.","call_objective":"Понять интерес и договориться о следующем шаге.","max_response_length":"3","calling_hours":f"{S.calling_hours_start}-{S.calling_hours_end}","timezone":S.app_timezone,"max_attempts":str(S.max_attempts),"delay_between_attempts":str(S.retry_delay_minutes),"max_concurrent_calls":str(S.max_concurrent_calls),"vosk_model_path":S.vosk_model_path,"piper_model_path":S.piper_model_path,"llm_provider":S.llm_provider,"llm_model":S.codex_model,"reasoning_effort":S.codex_reasoning_effort}
     stored={x.key:x.value for x in db.scalars(select(AppSetting)).all()}; defaults.update(stored)
     return {"values":defaults,"providers":{"auth_mode":S.auth_mode,"llm_provider":S.llm_provider,"telephony_provider":S.telephony_provider,"stt_provider":S.stt_provider,"tts_provider":S.tts_provider,"vosk_model_path":S.vosk_model_path,"piper_model_path":S.piper_model_path,"codex_model":S.codex_model,"reasoning_effort":S.codex_reasoning_effort}}
 

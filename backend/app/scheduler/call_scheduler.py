@@ -35,7 +35,8 @@ class CallScheduler:
             due=db.scalars(select(Callback).where(Callback.status=="SCHEDULED", Callback.scheduled_at<=now)).all()
             for cb in due:
                 lead=db.get(Lead,cb.lead_id)
-                if lead and lead.status!="DO_NOT_CALL": lead.status="QUEUED"; cb.status="DUE"
+                if not lead or lead.status=="DO_NOT_CALL": cb.status="CANCELED"
+                else: lead.status="QUEUED"; cb.status="DUE"
             db.commit()
             active_statuses=["STARTING","QUEUED","INITIATED","RINGING","ANSWERED","IN_PROGRESS"]
             active=db.scalar(select(func.count()).select_from(Call).where(Call.status.in_(active_statuses))) or 0

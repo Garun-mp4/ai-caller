@@ -7,6 +7,10 @@ backend/ai_caller.db
 backend/test_*.db
 frontend/node_modules/
 frontend/.next/
+frontend/playwright-report/
+frontend/test-results/
+frontend/.playwright-cli/
+frontend/*.tsbuildinfo
 models/vosk/*
 !models/vosk/.gitkeep
 models/piper/*

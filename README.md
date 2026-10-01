@@ -188,8 +188,13 @@ Frontend production build:
 
 ```bash
 cd frontend
+npm run lint
+npm run typecheck
+npm test
 npm run build
 ```
+
+The frontend browser suite runs against a local Next.js server and mocks the API, so it does not make real calls or require provider credentials. Install its browser once with `npx playwright install chromium`.
 
 Tests cover TXT import, duplicate detection, phone validation, structured agent output, mock LLM, mock telephony, campaign compliance, scheduler/callback flow and DO_NOT_CALL exclusion.
 

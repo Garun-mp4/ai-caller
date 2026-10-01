@@ -35,7 +35,8 @@ async def _finish_mock_call(db: Session, lead: Lead, campaign: Campaign | None, 
     t=time.perf_counter(); raw=await get_llm_provider().generate(build_sales_prompt(db, campaign.agent_prompt if campaign else ""),[],scenario); llm_ms=(time.perf_counter()-t)*1000
     d=parse_agent_decision(raw); db.add(TranscriptMessage(call_id=call.id,role="assistant",content=d.speech))
     call.llm_ms=llm_ms; call.total_ms=llm_ms; call.status="COMPLETED"; call.ended_at=datetime.now(timezone.utc); call.duration=max(1,int((call.ended_at-call.started_at).total_seconds()))
-    call.result=d.action; call.summary=f"Mock call: {d.reason or d.action}. Клиент: {scenario}"
+    action_summaries={"continue":"Разговор продолжается","end_call":"Разговор завершён","callback":"Нужен обратный звонок","interested":"Клиент проявил интерес","hot_lead":"Клиент готов к следующему шагу","do_not_call":"Клиент попросил больше не звонить"}
+    call.result=d.action; call.summary=f"Тестовый звонок. {d.reason or action_summaries.get(d.action, 'Результат сохранён')}. Клиент: {scenario}"
     apply_decision(db, lead, call, d)
     db.commit(); db.refresh(call)
 

@@ -1,8 +1,16 @@
-from datetime import datetime
-from pydantic import BaseModel, ConfigDict, Field
+from datetime import datetime, timezone
+from typing import Literal
+from pydantic import BaseModel, ConfigDict, Field, field_validator
 
 class ORMModel(BaseModel):
     model_config = ConfigDict(from_attributes=True)
+
+    @field_validator("*", mode="before")
+    @classmethod
+    def normalize_sqlite_datetimes(cls, value):
+        if isinstance(value, datetime) and value.tzinfo is None:
+            return value.replace(tzinfo=timezone.utc)
+        return value
 
 class LeadOut(ORMModel):
     id: int
@@ -78,6 +86,11 @@ class LeadUpdate(BaseModel):
 class CallbackCreate(BaseModel):
     scheduled_at: datetime
     reason: str = "Manual callback"
+
+class CallbackUpdate(BaseModel):
+    scheduled_at: datetime | None = None
+    status: Literal["SCHEDULED", "COMPLETED", "CANCELED"] | None = None
+    reason: str | None = Field(default=None, max_length=2000)
 
 class LoginRequest(BaseModel):
     username: str
