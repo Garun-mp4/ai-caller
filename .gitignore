@@ -1,0 +1,14 @@
+.env
+.venv/
+__pycache__/
+*.py[cod]
+.pytest_cache/
+backend/ai_caller.db
+backend/test_*.db
+frontend/node_modules/
+frontend/.next/
+models/vosk/*
+!models/vosk/.gitkeep
+models/piper/*
+!models/piper/.gitkeep
+*.zip
