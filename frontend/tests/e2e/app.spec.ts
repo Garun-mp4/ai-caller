@@ -31,7 +31,7 @@ async function fulfillJson(route: Route, value: unknown, status = 200) {
   });
 }
 
-async function mockApi(page: Page, options: { invalidLogin?: boolean } = {}): Promise<MockState> {
+async function mockApi(page: Page, options: { invalidLogin?: boolean; callsFailOnce?: boolean; extraCalls?: number } = {}): Promise<MockState> {
   const requests: MockRequest[] = [];
   const leads: LeadMock[] = [
     { id: 42, phone: '+79991112233', name: 'Анна', company: 'Альфа', notes: 'Позвонить после обеда', status: 'CALLBACK', result: null, attempts: 2, created_at: futureIso(-20), updated_at: futureIso(-1), next_call_at: futureIso(1), last_call_at: futureIso(-2) },
@@ -46,6 +46,9 @@ async function mockApi(page: Page, options: { invalidLogin?: boolean } = {}): Pr
     { id: 1, lead_id: 42, campaign_id: 1, phone: '+79991112233', started_at: futureIso(-1), answered_at: futureIso(-1), ended_at: futureIso(-1), duration: 104, status: 'COMPLETED', result: 'INTERESTED', summary: 'Договорились прислать предложение.', stt_ms: 180, llm_ms: 320, tts_ms: 210, total_ms: 710, transcripts: [{ id: 1, role: 'assistant', content: 'Добрый день! Удобно говорить?', timestamp: futureIso(-1) }, { id: 2, role: 'user', content: 'Да, расскажите подробнее.', timestamp: futureIso(-1) }] },
     { id: 2, lead_id: 43, campaign_id: 1, phone: '+79992223344', started_at: futureIso(-2), answered_at: null, ended_at: futureIso(-2), duration: 35, status: 'NO_ANSWER', result: 'No answer', summary: 'Абонент не ответил.', stt_ms: 0, llm_ms: 0, tts_ms: 0, total_ms: 0, transcripts: [] },
   ];
+  for (let index = 0; index < (options.extraCalls || 0); index += 1) {
+    calls.push({ ...calls[index % 2], id: index + 3, phone: `+7999${String(index + 100).padStart(7, '0')}`, started_at: futureIso(-index - 3), transcripts: [] });
+  }
   const campaigns: CampaignMock[] = [{ id: 1, name: 'Первичный контакт', description: 'Знакомство с потенциальными клиентами', agent_prompt: '', status: 'DRAFT', metrics: { total: 2, queued: 1, calling: 0, answered: 1, no_answer: 1, interested: 1, hot_leads: 1 } }];
   const settings: SettingsMock = {
     values: { agent_name: 'Алекс', company_name: 'Веб-студия', what_we_sell: 'Создание и улучшение сайтов', introduction: 'Добрый день! Можно задать короткий вопрос?', offer: 'Разработка сайтов', allowed_claims: 'Проверенные сведения', forbidden_claims: 'Не придумывать цены', call_objective: 'Договориться о следующем шаге', max_response_length: '3', calling_hours: '09:00-18:00', timezone: 'Europe/Astrakhan', max_attempts: '3', delay_between_attempts: '30', max_concurrent_calls: '1', vosk_model_path: '', piper_model_path: '', llm_provider: 'mock', llm_model: 'mock', reasoning_effort: 'low' },
@@ -53,6 +56,7 @@ async function mockApi(page: Page, options: { invalidLogin?: boolean } = {}): Pr
   };
   const health = { llm: { ok: true, provider: 'mock', detail: 'Тестовый провайдер отвечает' }, telephony: { ok: true, provider: 'mock', detail: 'Тестовые звонки включены' }, stt: { ok: false, provider: 'vosk', detail: 'Модель не настроена' }, tts: { ok: false, provider: 'piper', detail: { python: false, binary: false, model: '' } }, codex_on_path: false };
   let imported = false;
+  let callsFailedOnce = false;
 
   await page.route('**/api/**', async route => {
     const request = route.request();
@@ -163,7 +167,44 @@ async function mockApi(page: Page, options: { invalidLogin?: boolean } = {}): Pr
       if (typeof body.reason === 'string') callback.reason = body.reason;
       return fulfillJson(route, callback);
     }
-    if (path === '/calls' && method === 'GET') return fulfillJson(route, calls);
+    if (path === '/calls' && method === 'GET') {
+      if (options.callsFailOnce && !callsFailedOnce) {
+        callsFailedOnce = true;
+        return fulfillJson(route, { detail: 'Service unavailable' }, 503);
+      }
+      const params = new URLSearchParams(url.search);
+      const search = (params.get('search') || '').toLowerCase();
+      const status = params.get('status') || '';
+      const page = Number(params.get('page') || 1);
+      const pageSize = Number(params.get('page_size') || 25);
+      const filtered = calls.filter(call => {
+        const normalizedStatus = call.status.toUpperCase().replace(/[\s-]+/g, '_');
+        const normalizedResult = (call.result || '').toUpperCase().replace(/[\s-]+/g, '_');
+        const matchesSearch = !search || call.phone.toLowerCase().includes(search);
+        const matchesStatus = !status || (status === 'ANSWERED'
+          ? Boolean(call.answered_at)
+          : status === 'IN_PROGRESS'
+            ? ['STARTING', 'QUEUED', 'INITIATED', 'RINGING', 'ANSWERED', 'IN_PROGRESS'].includes(normalizedStatus)
+            : status === 'FAILED'
+              ? ['FAILED', 'PROVIDER_ERROR'].includes(normalizedStatus) || ['FAILED', 'PROVIDER_ERROR'].includes(normalizedResult)
+              : normalizedStatus === status || normalizedResult === status);
+        return matchesSearch && matchesStatus;
+      });
+      const items = filtered.slice((page - 1) * pageSize, page * pageSize);
+      return fulfillJson(route, {
+        items,
+        total: filtered.length,
+        page,
+        page_size: pageSize,
+        page_count: Math.max(1, Math.ceil(filtered.length / pageSize)),
+        stats: {
+          total: calls.length,
+          answered: calls.filter(call => Boolean(call.answered_at) || call.status === 'ANSWERED').length,
+          average_duration: calls.length ? calls.reduce((sum, call) => sum + call.duration, 0) / calls.length : 0,
+          with_transcript: calls.filter(call => call.transcripts.length > 0).length,
+        },
+      });
+    }
     if (path === '/settings' && method === 'GET') return fulfillJson(route, settings);
     if (path === '/settings' && method === 'PUT') { settings.values = Object.fromEntries(Object.entries(body).map(([key, value]) => [key, String(value)])); return fulfillJson(route, { ok: true }); }
 
@@ -172,9 +213,9 @@ async function mockApi(page: Page, options: { invalidLogin?: boolean } = {}): Pr
   return { requests, leads, callbacks, calls, campaigns, settings };
 }
 
-async function enterWorkspace(page: Page): Promise<MockState> {
+async function enterWorkspace(page: Page, options: { callsFailOnce?: boolean; extraCalls?: number } = {}): Promise<MockState> {
   await page.addInitScript(() => localStorage.setItem('token', 'test-token'));
-  return mockApi(page);
+  return mockApi(page, options);
 }
 
 test('login translates authentication errors and keeps the operator on the sign-in screen', async ({ page }) => {
@@ -344,6 +385,57 @@ test('calls can be filtered and the transcript stays attached to its call', asyn
   await noAnswer.locator('summary').click();
   await expect(noAnswer.getByText('Абонент не ответил.')).toBeVisible();
   await expect(page.getByText('Добрый день! Удобно говорить?')).toHaveCount(0);
+  await page.getByLabel('Фильтр по результату').selectOption('ANSWERED');
+  await expect(page.locator('details.call-card')).toHaveCount(1);
+  await expect(page.locator('details.call-card').first()).toContainText('+79991112233');
+});
+
+test('calls search is server-backed and global metrics stay unchanged', async ({ page }) => {
+  const mocks = await enterWorkspace(page);
+  await page.goto('/calls');
+  await expect(page.getByText('1–2 из 2')).toBeVisible();
+  await expect(page.locator('.metric-card').filter({ hasText: 'Всего звонков' }).locator('.metric-value')).toHaveText('2');
+  await page.getByPlaceholder('Поиск по телефону').fill('223344');
+  await expect(page.getByText('1–1 из 1')).toBeVisible();
+  await expect(page.locator('details.call-card')).toHaveCount(1);
+  await expect(page.locator('.metric-card').filter({ hasText: 'Всего звонков' }).locator('.metric-value')).toHaveText('2');
+  expect(mocks.requests.some(request => request.path === '/calls' && request.search.includes('search=223344'))).toBe(true);
+});
+
+test('calls pagination requests the next server page', async ({ page }) => {
+  const mocks = await enterWorkspace(page, { extraCalls: 23 });
+  await page.goto('/calls');
+  await expect(page.locator('details.call-card')).toHaveCount(20);
+  await expect(page.getByRole('navigation', { name: 'Страницы истории звонков' })).toContainText('Страница 1 из 2');
+  await page.getByRole('button', { name: 'Вперёд' }).click();
+  await expect(page.locator('details.call-card')).toHaveCount(5);
+  await expect(page.getByRole('navigation', { name: 'Страницы истории звонков' })).toContainText('Страница 2 из 2');
+  expect(mocks.requests.some(request => request.path === '/calls' && request.search.includes('page=2'))).toBe(true);
+});
+
+test('calls let the operator retry a failed load and explain an empty search', async ({ page }) => {
+  const mocks = await enterWorkspace(page, { callsFailOnce: true });
+  await page.goto('/calls');
+  await expect(page.getByRole('alert').filter({ hasText: 'Не удалось выполнить запрос' })).toBeVisible();
+  await page.getByRole('button', { name: 'Повторить' }).click();
+  await expect(page.locator('details.call-card')).toHaveCount(2);
+  await page.getByPlaceholder('Поиск по телефону').fill('0000000000');
+  await expect(page.getByRole('heading', { name: 'Звонки не найдены' })).toBeVisible();
+  await expect(page.getByText('0–0 из 0')).toBeVisible();
+  await expect(page.locator('.metric-card').filter({ hasText: 'Всего звонков' }).locator('.metric-value')).toHaveText('2');
+  expect(mocks.requests.filter(request => request.path === '/calls').length).toBeGreaterThanOrEqual(3);
+});
+
+test('calls history remains readable without horizontal overflow on mobile', async ({ page }) => {
+  await enterWorkspace(page);
+  await page.setViewportSize({ width: 390, height: 844 });
+  await page.goto('/calls');
+  await expect(page.getByRole('heading', { name: 'Звонки' })).toBeVisible();
+  await expect(page.locator('details.call-card')).toHaveCount(2);
+  await page.locator('details.call-card').first().locator('summary').click();
+  await expect(page.getByText('Добрый день! Удобно говорить?')).toBeVisible();
+  const dimensions = await page.evaluate(() => ({ document: document.documentElement.scrollWidth, viewport: document.documentElement.clientWidth }));
+  expect(dimensions.document).toBeLessThanOrEqual(dimensions.viewport);
 });
 
 test('settings save changes and display provider health as clear statuses', async ({ page }) => {

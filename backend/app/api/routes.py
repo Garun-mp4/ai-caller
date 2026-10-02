@@ -228,9 +228,47 @@ async def scheduler_tick():
         raise HTTPException(status_code=403, detail="Manual scheduler tick is available only in development")
     return {"processed":await scheduler.tick(ignore_hours=True)}
 
-@router.get("/calls", dependencies=[Depends(require_user)])
-def calls(db:Session=Depends(get_db)):
-    rows=db.scalars(select(Call).options(selectinload(Call.transcripts)).order_by(Call.id.desc()).limit(200)).all(); return [CallOut.model_validate(c) for c in rows]
+@router.get("/calls", response_model=CallPageOut, dependencies=[Depends(require_user)])
+def calls(
+    search: str|None=Query(default=None,max_length=120),
+    status: Literal["ANSWERED","NO_ANSWER","BUSY","FAILED","IN_PROGRESS"]|None=None,
+    page: int=Query(default=1,ge=1),
+    page_size: int=Query(default=25,ge=1,le=100),
+    db:Session=Depends(get_db),
+):
+    filters=[]
+    answered_call=or_(Call.answered_at.is_not(None),Call.status=="ANSWERED")
+    if status=="ANSWERED":
+        filters.append(answered_call)
+    elif status in ("NO_ANSWER","BUSY"):
+        filters.append(or_(func.upper(Call.status)==status,func.upper(Call.result)==status))
+    elif status=="FAILED":
+        filters.append(or_(func.upper(Call.status).in_(["FAILED","PROVIDER_ERROR"]),func.upper(Call.result).in_(["FAILED","PROVIDER_ERROR"])))
+    elif status=="IN_PROGRESS":
+        filters.append(Call.status.in_(["STARTING","QUEUED","INITIATED","RINGING","ANSWERED","IN_PROGRESS"]))
+
+    query=(search or "").strip()
+    if query:
+        escaped=query.replace("\\","\\\\").replace("%","\\%").replace("_","\\_")
+        filters.append(Call.phone.ilike(f"%{escaped}%",escape="\\"))
+
+    total=db.scalar(select(func.count()).select_from(Call).where(*filters)) or 0
+    rows=db.scalars(
+        select(Call)
+        .where(*filters)
+        .options(selectinload(Call.transcripts))
+        .order_by(Call.started_at.desc(),Call.id.desc())
+        .offset((page-1)*page_size)
+        .limit(page_size)
+    ).all()
+    page_count=max(1,(total+page_size-1)//page_size)
+    stats={
+        "total":db.scalar(select(func.count()).select_from(Call)) or 0,
+        "answered":db.scalar(select(func.count()).select_from(Call).where(answered_call)) or 0,
+        "average_duration":db.scalar(select(func.avg(Call.duration))) or 0,
+        "with_transcript":db.scalar(select(func.count(func.distinct(TranscriptMessage.call_id)))) or 0,
+    }
+    return {"items":rows,"total":total,"page":page,"page_size":page_size,"page_count":page_count,"stats":stats}
 
 @router.get("/callbacks", dependencies=[Depends(require_user)])
 def callbacks(db:Session=Depends(get_db)):

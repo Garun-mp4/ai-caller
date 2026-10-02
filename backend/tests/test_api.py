@@ -1,7 +1,7 @@
 from fastapi.testclient import TestClient
 from datetime import datetime, timedelta, timezone
 from app.main import app
-from app.models import Callback, Lead, Campaign, CampaignLead, Call, AppSetting
+from app.models import Callback, Lead, Campaign, CampaignLead, Call, TranscriptMessage, AppSetting
 from app.api.routes import S, twilio_status
 from app.stt.factory import get_stt_provider
 
@@ -97,6 +97,59 @@ def test_leads_are_server_paginated_sorted_and_search_contact_name(db):
 
         bounded=c.get('/api/leads',params={'page_size':101},headers=h)
         assert bounded.status_code==422
+
+def test_calls_are_server_paginated_searchable_and_count_answered_calls_globally(db):
+    lead=Lead(phone='+79991110000',status='NEW')
+    db.add(lead)
+    db.flush()
+    now=datetime.now(timezone.utc)
+    calls=[]
+    for i in range(205):
+        status='ANSWERED' if i==1 else ('COMPLETED','NO_ANSWER','IN_PROGRESS','FAILED')[i%4]
+        call=Call(
+            lead_id=lead.id,
+            phone=f'+7999{i:07d}',
+            status=status,
+            result='INTERESTED' if i%4==0 else ('no-answer' if i%4==1 else None),
+            started_at=now-timedelta(seconds=i),
+            answered_at=now-timedelta(seconds=i) if i%4==0 else None,
+            duration=i,
+        )
+        if i%10==0:
+            call.transcripts.append(TranscriptMessage(role='user',content=f'Фраза {i}'))
+        calls.append(call)
+    db.add_all(calls)
+    db.commit()
+
+    with TestClient(app) as c:
+        h=auth(c)
+        unauthorized=c.get('/api/calls')
+        assert unauthorized.status_code==401
+
+        second=c.get('/api/calls',params={'page':2,'page_size':25},headers=h)
+        assert second.status_code==200
+        payload=second.json()
+        assert payload['total']==205 and payload['page']==2 and payload['page_size']==25 and payload['page_count']==9
+        assert len(payload['items'])==25
+        assert payload['items'][0]['phone']==f'+7999{25:07d}'
+        assert payload['stats']=={'total':205,'answered':53,'average_duration':102.0,'with_transcript':21}
+
+        answered=c.get('/api/calls',params={'status':'ANSWERED','page_size':100},headers=h).json()
+        assert answered['total']==53
+        assert all(item['answered_at'] or item['status']=='ANSWERED' for item in answered['items'])
+        assert answered['stats']==payload['stats']
+
+        searched=c.get('/api/calls',params={'search':'0000042'},headers=h).json()
+        assert searched['total']==1
+        assert searched['items'][0]['phone']==f'+7999{42:07d}'
+
+        literal_wildcard=c.get('/api/calls',params={'search':'%'},headers=h).json()
+        assert literal_wildcard['total']==0
+
+        bounded=c.get('/api/calls',params={'page_size':101},headers=h)
+        invalid_status=c.get('/api/calls',params={'status':'UNKNOWN'},headers=h)
+        assert bounded.status_code==422
+        assert invalid_status.status_code==422
 
 def test_campaign_audience_excludes_completed_and_dnc_and_attachment_is_idempotent(db):
     campaign=Campaign(name='Safe audience',status='DRAFT')

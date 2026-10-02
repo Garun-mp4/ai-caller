@@ -70,6 +70,20 @@ class CallOut(ORMModel):
     total_ms: float
     transcripts: list[TranscriptOut] = []
 
+class CallStatsOut(BaseModel):
+    total: int
+    answered: int
+    average_duration: float
+    with_transcript: int
+
+class CallPageOut(BaseModel):
+    items: list[CallOut]
+    total: int
+    page: int
+    page_size: int
+    page_count: int
+    stats: CallStatsOut
+
 class CallbackOut(ORMModel):
     id: int
     lead_id: int
