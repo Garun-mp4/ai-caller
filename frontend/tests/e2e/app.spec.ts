@@ -31,7 +31,7 @@ async function fulfillJson(route: Route, value: unknown, status = 200) {
   });
 }
 
-async function mockApi(page: Page, options: { invalidLogin?: boolean; callsFailOnce?: boolean; extraCalls?: number; callbackFailOnce?: boolean; extraCallbacks?: number } = {}): Promise<MockState> {
+async function mockApi(page: Page, options: { invalidLogin?: boolean; callsFailOnce?: boolean; extraCalls?: number; callbackFailOnce?: boolean; extraCallbacks?: number; providerFailOnce?: boolean } = {}): Promise<MockState> {
   const requests: MockRequest[] = [];
   const leads: LeadMock[] = [
     { id: 42, phone: '+79991112233', name: 'Анна', company: 'Альфа', notes: 'Позвонить после обеда', status: 'CALLBACK', result: null, attempts: 2, created_at: futureIso(-20), updated_at: futureIso(-1), next_call_at: futureIso(1), last_call_at: futureIso(-2) },
@@ -61,6 +61,7 @@ async function mockApi(page: Page, options: { invalidLogin?: boolean; callsFailO
   let imported = false;
   let callsFailedOnce = false;
   let callbacksFailedOnce = false;
+  let healthFailedOnce = false;
 
   await page.route('**/api/**', async route => {
     const request = route.request();
@@ -79,7 +80,10 @@ async function mockApi(page: Page, options: { invalidLogin?: boolean; callsFailO
 
     if (path === '/auth/config' && method === 'GET') return fulfillJson(route, { mode: 'local', chatgpt_oauth_available: false });
     if (path === '/auth/login' && method === 'POST') return options.invalidLogin ? fulfillJson(route, { detail: 'Invalid credentials' }, 401) : fulfillJson(route, { access_token: 'test-token', token_type: 'bearer', user: 'admin' });
-    if (path === '/providers/health' && method === 'GET') return fulfillJson(route, health);
+    if (path === '/providers/health' && method === 'GET') {
+      if (options.providerFailOnce && !healthFailedOnce) { healthFailedOnce = true; return fulfillJson(route, { detail: 'Provider health unavailable' }, 503); }
+      return fulfillJson(route, health);
+    }
     if (path === '/dashboard' && method === 'GET') return fulfillJson(route, {
       stats: { total_leads: leads.length, calls_today: 3, answered: 2, interested: 1, hot_leads: 1, callbacks: 2, no_answer: 1 },
       recent_calls: calls.slice(0, 1),
@@ -252,14 +256,14 @@ async function mockApi(page: Page, options: { invalidLogin?: boolean; callsFailO
       });
     }
     if (path === '/settings' && method === 'GET') return fulfillJson(route, settings);
-    if (path === '/settings' && method === 'PUT') { settings.values = Object.fromEntries(Object.entries(body).map(([key, value]) => [key, String(value)])); return fulfillJson(route, { ok: true }); }
+    if (path === '/settings' && method === 'PUT') { settings.values = { ...settings.values, ...Object.fromEntries(Object.entries(body).map(([key, value]) => [key, String(value)])) }; return fulfillJson(route, { ok: true }); }
 
     return fulfillJson(route, { detail: `Unhandled mock route: ${method} ${path}` }, 500);
   });
   return { requests, leads, callbacks, calls, campaigns, settings };
 }
 
-async function enterWorkspace(page: Page, options: { callsFailOnce?: boolean; extraCalls?: number; callbackFailOnce?: boolean; extraCallbacks?: number } = {}): Promise<MockState> {
+async function enterWorkspace(page: Page, options: { callsFailOnce?: boolean; extraCalls?: number; callbackFailOnce?: boolean; extraCallbacks?: number; providerFailOnce?: boolean } = {}): Promise<MockState> {
   await page.addInitScript(() => localStorage.setItem('token', 'test-token'));
   return mockApi(page, options);
 }
@@ -524,6 +528,59 @@ test('settings save changes and display provider health as clear statuses', asyn
   await expect(page.getByRole('status').filter({ hasText: 'Настройки сохранены' })).toBeVisible();
   expect(mocks.settings.values.agent_name).toBe('Наталья');
   await expect(page.getByText('Доступен').first()).toBeVisible();
+});
+
+test('provider health can be retried without discarding unsaved settings', async ({ page }) => {
+  const mocks = await enterWorkspace(page, { providerFailOnce: true });
+  await page.goto('/settings');
+  await expect(page.getByText('Не удалось получить состояние провайдеров.')).toBeVisible();
+
+  await page.getByLabel('Имя агента').fill('Наталья');
+  const save = page.getByRole('button', { name: 'Сохранить изменения' });
+  await expect(save).toBeEnabled();
+  await page.getByRole('button', { name: 'Проверить снова' }).click();
+  await expect(page.getByText('Проверяем…')).toHaveCount(0);
+  await expect(page.getByText('Доступен').first()).toBeVisible();
+  await expect(page.getByLabel('Имя агента')).toHaveValue('Наталья');
+  await expect(save).toBeEnabled();
+  expect(mocks.requests.filter(request => request.path === '/settings' && request.method === 'GET')).toHaveLength(1);
+
+  await save.click();
+  await expect(page.getByRole('status').filter({ hasText: 'Настройки сохранены' })).toBeVisible();
+  expect(mocks.settings.values.agent_name).toBe('Наталья');
+});
+
+test('settings show inline validation and do not send invalid values', async ({ page }) => {
+  const mocks = await enterWorkspace(page);
+  await page.goto('/settings');
+  await page.getByLabel('Попыток на контакт').fill('0');
+  await page.getByRole('button', { name: 'Сохранить изменения' }).click();
+  await expect(page.getByText('Допустимое значение: от 1 до 50.')).toBeVisible();
+  await expect(page.getByLabel('Попыток на контакт')).toHaveAttribute('aria-invalid', 'true');
+  expect(mocks.requests.filter(request => request.path === '/settings' && request.method === 'PUT')).toHaveLength(0);
+
+  await page.getByLabel('Попыток на контакт').fill('3');
+  await page.getByLabel('Часовой пояс').fill('Not/A_Timezone');
+  await page.getByRole('button', { name: 'Сохранить изменения' }).click();
+  await expect(page.getByText('Укажите часовой пояс IANA, например Europe/Astrakhan.')).toBeVisible();
+  await expect(page.getByLabel('Часовой пояс')).toHaveAttribute('aria-invalid', 'true');
+  expect(mocks.requests.filter(request => request.path === '/settings' && request.method === 'PUT')).toHaveLength(0);
+
+  await page.getByLabel('Часовой пояс').fill('Europe/Astrakhan');
+  await page.getByLabel('Разрешённое время звонков').fill('22:00-06:00');
+  await page.getByRole('button', { name: 'Сохранить изменения' }).click();
+  await expect(page.getByText('Время окончания должно быть позже времени начала.')).toBeVisible();
+  await expect(page.getByLabel('Разрешённое время звонков')).toHaveAttribute('aria-invalid', 'true');
+  expect(mocks.requests.filter(request => request.path === '/settings' && request.method === 'PUT')).toHaveLength(0);
+
+  await page.getByLabel('Разрешённое время звонков').fill('09:00-18:00');
+  await page.getByLabel('Попыток на контакт').fill('4');
+  await page.getByRole('button', { name: 'Сохранить изменения' }).click();
+  await expect(page.getByRole('status').filter({ hasText: 'Настройки сохранены' })).toBeVisible();
+  expect(mocks.settings.values.max_attempts).toBe('4');
+  expect(mocks.settings.values.timezone).toBe('Europe/Astrakhan');
+  expect(mocks.settings.values.calling_hours).toBe('09:00-18:00');
+  expect(mocks.requests.filter(request => request.path === '/settings' && request.method === 'PUT')).toHaveLength(1);
 });
 
 test('theme preference persists and mobile navigation fits the viewport', async ({ page }) => {

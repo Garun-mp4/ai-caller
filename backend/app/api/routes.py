@@ -31,6 +31,9 @@ router=APIRouter(prefix="/api")
 log=logging.getLogger(__name__)
 S=get_settings()
 
+def answered_call_predicate():
+    return or_(Call.answered_at.is_not(None),Call.status=="ANSWERED")
+
 @router.get("/health")
 def health(): return {"ok":True,"app":S.app_name,"env":S.app_env}
 
@@ -67,7 +70,7 @@ async def chatgpt_callback(code: str, state: str):
     target = S.frontend_url.rstrip("/") + "/login?" + __import__("urllib.parse", fromlist=["urlencode"]).urlencode({"token": app_token, "user": identity["name"]})
     return RedirectResponse(target, status_code=302)
 
-@router.get("/dashboard", dependencies=[Depends(require_user)])
+@router.get("/dashboard", response_model=DashboardOut, dependencies=[Depends(require_user)])
 def dashboard(db: Session=Depends(get_db)):
     pref=call_preferences(db)
     local_now=datetime.now(ZoneInfo(pref["timezone"]))
@@ -75,11 +78,11 @@ def dashboard(db: Session=Depends(get_db)):
     day_start=local_start.astimezone(timezone.utc)
     day_end=(local_start+timedelta(days=1)).astimezone(timezone.utc)
     leads=db.scalar(select(func.count()).select_from(Lead)) or 0
-    calls=db.scalars(select(Call).options(selectinload(Call.transcripts)).order_by(Call.id.desc()).limit(6)).all()
+    calls=db.scalars(select(Call).order_by(Call.started_at.desc(),Call.id.desc()).limit(6)).all()
     callbacks=db.scalars(select(Callback).where(Callback.status.in_(["SCHEDULED","DUE"])).order_by(Callback.scheduled_at).limit(6)).all()
     statuses=dict(db.execute(select(Lead.status,func.count()).group_by(Lead.status)).all())
     calls_today=db.scalar(select(func.count()).select_from(Call).where(Call.started_at>=day_start,Call.started_at<day_end)) or 0
-    return {"stats":{"total_leads":leads,"calls_today":calls_today,"answered":db.scalar(select(func.count()).select_from(Call).where(Call.answered_at.is_not(None))) or 0,"interested":statuses.get("INTERESTED",0),"hot_leads":statuses.get("HOT_LEAD",0),"callbacks":statuses.get("CALLBACK",0),"no_answer":statuses.get("NO_ANSWER",0)},"recent_calls":[CallOut.model_validate(c) for c in calls],"callbacks":[CallbackOut.model_validate(c) for c in callbacks]}
+    return {"stats":{"total_leads":leads,"calls_today":calls_today,"answered":db.scalar(select(func.count()).select_from(Call).where(answered_call_predicate())) or 0,"interested":statuses.get("INTERESTED",0),"hot_leads":statuses.get("HOT_LEAD",0),"callbacks":statuses.get("CALLBACK",0),"no_answer":statuses.get("NO_ANSWER",0)},"recent_calls":[DashboardCallOut.model_validate(c) for c in calls],"callbacks":[CallbackOut.model_validate(c) for c in callbacks]}
 
 @router.post("/leads/import", dependencies=[Depends(require_user)])
 async def import_leads(file: UploadFile=File(...), db: Session=Depends(get_db)):
@@ -168,7 +171,7 @@ async def call_now(lead_id:int,db:Session=Depends(get_db)):
 def campaigns(db:Session=Depends(get_db)):
     campaign_rows=db.scalars(select(Campaign).order_by(Campaign.id.desc())).all()
     status_rows=db.execute(select(CampaignLead.campaign_id,Lead.status,func.count()).join(Lead,Lead.id==CampaignLead.lead_id).group_by(CampaignLead.campaign_id,Lead.status)).all()
-    answered_rows=db.execute(select(Call.campaign_id,func.count()).where(Call.campaign_id.is_not(None),Call.answered_at.is_not(None)).group_by(Call.campaign_id)).all()
+    answered_rows=db.execute(select(Call.campaign_id,func.count()).where(Call.campaign_id.is_not(None),answered_call_predicate()).group_by(Call.campaign_id)).all()
     stats_by_campaign={}
     for campaign_id,status,count in status_rows:
         stats_by_campaign.setdefault(campaign_id,{})[status]=count
@@ -237,7 +240,7 @@ def calls(
     db:Session=Depends(get_db),
 ):
     filters=[]
-    answered_call=or_(Call.answered_at.is_not(None),Call.status=="ANSWERED")
+    answered_call=answered_call_predicate()
     if status=="ANSWERED":
         filters.append(answered_call)
     elif status in ("NO_ANSWER","BUSY"):

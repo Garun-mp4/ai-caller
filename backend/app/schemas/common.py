@@ -84,6 +84,24 @@ class CallPageOut(BaseModel):
     page_count: int
     stats: CallStatsOut
 
+class DashboardStatsOut(BaseModel):
+    total_leads: int
+    calls_today: int
+    answered: int
+    interested: int
+    hot_leads: int
+    callbacks: int
+    no_answer: int
+
+class DashboardCallOut(ORMModel):
+    id: int
+    lead_id: int
+    phone: str
+    started_at: datetime
+    status: str
+    result: str | None
+    summary: str
+
 class CallbackOut(ORMModel):
     id: int
     lead_id: int
@@ -92,6 +110,11 @@ class CallbackOut(ORMModel):
     scheduled_at: datetime
     status: str
     created_at: datetime
+
+class DashboardOut(BaseModel):
+    stats: DashboardStatsOut
+    recent_calls: list[DashboardCallOut]
+    callbacks: list[CallbackOut]
 
 class CallbackListOut(CallbackOut):
     phone: str

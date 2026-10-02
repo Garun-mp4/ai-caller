@@ -343,21 +343,33 @@ def test_dashboard_counts_only_calls_started_in_operator_local_day(db):
 
     db.add(AppSetting(key='timezone',value='Europe/Astrakhan'))
     lead=Lead(phone='+79994440001',status='DONE')
-    db.add(lead)
+    campaign=Campaign(name='Проверка метрик')
+    db.add_all([lead,campaign])
     db.flush()
     now=datetime.now(ZoneInfo('Europe/Astrakhan'))
     start=now.replace(hour=0,minute=0,second=0,microsecond=0)
     yesterday=(start-timedelta(days=1)).astimezone(timezone.utc)
     today=start.astimezone(timezone.utc)
-    db.add_all([
-        Call(lead_id=lead.id,phone=lead.phone,status='COMPLETED',started_at=yesterday),
-        Call(lead_id=lead.id,phone=lead.phone,status='COMPLETED',started_at=today),
-    ])
+    today_call=Call(lead_id=lead.id,campaign_id=campaign.id,phone=lead.phone,status='ANSWERED',started_at=today,summary='Сегодняшний звонок')
+    yesterday_call=Call(lead_id=lead.id,campaign_id=campaign.id,phone=lead.phone,status='COMPLETED',started_at=yesterday,answered_at=yesterday+timedelta(minutes=1),summary='Вчерашний звонок')
+    db.add_all([today_call,yesterday_call])
+    db.flush()
+    db.add(TranscriptMessage(call_id=today_call.id,role='assistant',content='Приветствие'))
     db.commit()
     with TestClient(app) as c:
-        response=c.get('/api/dashboard',headers=auth(c))
+        h=auth(c)
+        response=c.get('/api/dashboard',headers=h)
         assert response.status_code==200
-        assert response.json()['stats']['calls_today']==1
+        dashboard=response.json()
+        assert dashboard['stats']['calls_today']==1
+        assert dashboard['stats']['answered']==2
+        assert dashboard['recent_calls'][0]['id']==today_call.id
+        assert 'transcripts' not in dashboard['recent_calls'][0]
+
+        campaign_metrics=c.get('/api/campaigns',headers=h).json()[0]['metrics']
+        assert campaign_metrics['answered']==2
+        call_stats=c.get('/api/calls',headers=h).json()['stats']
+        assert call_stats['answered']==2
 
 def test_repeated_twilio_terminal_webhook_creates_only_one_retry(db):
     lead=Lead(phone='+79994440002',status='CALLING',attempts=1)
