@@ -60,7 +60,19 @@ Open:
 - Backend API: http://localhost:8000
 - Swagger: http://localhost:8000/docs
 
-Default development login is `admin` / `admin`. Change `LOCAL_ADMIN_USERNAME`, `LOCAL_ADMIN_PASSWORD` and `JWT_SECRET` in `.env` for any non-throwaway environment.
+Default development login is `admin` / `admin`. Change `LOCAL_ADMIN_USERNAME`, `LOCAL_ADMIN_PASSWORD` and `JWT_SECRET` in `.env` for any non-throwaway environment. Production startup rejects the built-in defaults, local passwords shorter than 12 characters, and JWT keys shorter than 32 characters.
+
+### Docker Compose
+
+Copy `.env.example` to `.env` if you do not already have a local configuration, then run:
+
+```powershell
+docker compose config --quiet
+docker compose up --build -d
+docker compose ps
+```
+
+The frontend is at http://localhost:3000 and the API at http://localhost:8000. Compose builds dependencies into images instead of reinstalling them on every restart, waits for the API database readiness check before starting the frontend, and binds both ports to loopback by default. SQLite remains at `backend/ai_caller.db`; keep the `./backend:/app/backend` bind mount when changing the Compose setup. Set `HOST_BIND_ADDRESS` explicitly if the service must be reachable from another machine. Do not use `docker compose down -v` when retaining the frontend dependency/cache volumes matters.
 
 ## Quick mock-mode test
 
@@ -200,7 +212,7 @@ Tests cover TXT import, duplicate detection, phone validation, structured agent 
 
 ## Production considerations
 
-This is an MVP, not a production dialer. Before production use, migrate to PostgreSQL, use a real job queue/worker, add robust distributed call locks/idempotency, signed Twilio webhook validation, rate limiting, TLS, secrets management, per-user authorization, audit logs, proper WebRTC/telephony observability, a production-grade VAD, explicit timezone handling for natural-language callback dates, retries/dead letters, and a legal/compliance review appropriate to your target markets.
+This is an MVP, not a production dialer. Production mode currently rejects known development credentials, and Twilio HTTP/WebSocket callbacks validate signatures. Before production use, migrate to PostgreSQL, use a real job queue/worker, add robust distributed call locks/idempotency, rate limiting, managed secrets, per-user authorization, audit logs, stronger telephony observability, a production-grade VAD, explicit timezone handling for natural-language callback dates, retries/dead letters, and a legal/compliance review appropriate to your target markets.
 
 ## Replacing Codex CLI with OpenAI API later
 

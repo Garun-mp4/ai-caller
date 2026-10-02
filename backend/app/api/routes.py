@@ -4,7 +4,8 @@ import shutil
 from fastapi import APIRouter, Depends, UploadFile, File, HTTPException, WebSocket, Form
 from fastapi.responses import Response, RedirectResponse
 from sqlalchemy.orm import Session, selectinload
-from sqlalchemy import select, func, or_
+from sqlalchemy import select, func, or_, text
+from sqlalchemy.exc import SQLAlchemyError
 from app.core.config import get_settings
 from app.core.security import create_token, require_user
 from app.core.chatgpt_auth import begin_chatgpt_login, finish_chatgpt_login
@@ -21,6 +22,7 @@ from app.services.call_service import initiate_call, apply_decision
 from app.agent.prompt import build_sales_prompt, configured_introduction
 from app.services.settings_service import call_preferences
 from app.telephony.media_stream import handle_twilio_media
+from app.telephony.request_validation import validate_twilio_request, validate_twilio_websocket
 
 router=APIRouter(prefix="/api")
 log=logging.getLogger(__name__)
@@ -28,6 +30,14 @@ S=get_settings()
 
 @router.get("/health")
 def health(): return {"ok":True,"app":S.app_name,"env":S.app_env}
+
+@router.get("/health/ready")
+def readiness(db:Session=Depends(get_db)):
+    try:
+        db.execute(text("SELECT 1"))
+    except SQLAlchemyError:
+        raise HTTPException(status_code=503,detail="Database is not ready")
+    return {"ok":True,"database":"ready"}
 
 @router.post("/auth/login")
 def login(req: LoginRequest):
@@ -233,13 +243,13 @@ async def providers_health():
     llm=await get_llm_provider().health(); tel=await get_telephony_provider().health(); tts=await get_tts_provider().health(); stt=get_stt_provider().health()
     return {"llm":llm,"telephony":tel,"tts":tts,"stt":stt,"codex_on_path":bool(shutil.which(S.codex_binary))}
 
-@router.post("/telephony/twiml/{call_id}", response_class=Response)
+@router.post("/telephony/twiml/{call_id}", response_class=Response, dependencies=[Depends(validate_twilio_request)])
 def twiml(call_id:int):
     ws=S.public_base_url.replace("https://","wss://").replace("http://","ws://").rstrip('/')
     xml=f"<?xml version='1.0' encoding='UTF-8'?><Response><Connect><Stream url='{ws}/api/telephony/media/{call_id}' /></Connect></Response>"
     return Response(content=xml,media_type="application/xml")
 
-@router.post("/telephony/status/{call_id}")
+@router.post("/telephony/status/{call_id}", dependencies=[Depends(validate_twilio_request)])
 def twilio_status(call_id:int, CallStatus:str=Form(default=""), CallSid:str=Form(default=""), db:Session=Depends(get_db)):
     c=db.get(Call,call_id)
     if c:
@@ -267,6 +277,9 @@ def twilio_status(call_id:int, CallStatus:str=Form(default=""), CallSid:str=Form
 
 @router.websocket("/telephony/media/{call_id}")
 async def media(websocket:WebSocket,call_id:int):
+    if not validate_twilio_websocket(websocket):
+        await websocket.close(code=1008,reason="Invalid Twilio request signature")
+        return
     setup_db=SessionLocal()
     try:
         c=setup_db.get(Call,call_id)

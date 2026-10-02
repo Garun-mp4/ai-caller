@@ -68,7 +68,7 @@ def test_callback_rejects_past_schedule_and_requires_authentication(db):
 
 def test_manual_scheduler_tick_is_disabled_in_production(monkeypatch):
     monkeypatch.setattr(S, "app_env", "production")
-    with TestClient(app) as c:
-        response=c.post('/api/scheduler/tick',headers=auth(c))
-        assert response.status_code==403
-        assert response.json()["detail"]=="Manual scheduler tick is available only in development"
+    c=TestClient(app)
+    response=c.post('/api/scheduler/tick',headers=auth(c))
+    assert response.status_code==403
+    assert response.json()["detail"]=="Manual scheduler tick is available only in development"

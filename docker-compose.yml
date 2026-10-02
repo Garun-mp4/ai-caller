@@ -1,16 +1,57 @@
 services:
   backend:
-    image: python:3.12-slim
+    build:
+      context: ./backend
+    restart: unless-stopped
     working_dir: /app/backend
-    volumes: [".:/app"]
-    command: sh -c "pip install -r requirements.txt && alembic upgrade head && uvicorn app.main:app --host 0.0.0.0 --port 8000"
-    ports: ["8000:8000"]
-    env_file: .env
+    volumes:
+      - ./backend:/app/backend
+      - ./models:/app/models:ro
+    ports:
+      - "${HOST_BIND_ADDRESS:-127.0.0.1}:8000:8000"
+    env_file:
+      - .env
+    environment:
+      PYTHONUNBUFFERED: "1"
+    healthcheck:
+      test:
+        - CMD
+        - python
+        - -c
+        - "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8000/api/health/ready', timeout=3).read()"
+      interval: 10s
+      timeout: 5s
+      retries: 6
+      start_period: 20s
+
   frontend:
-    image: node:22-alpine
+    build:
+      context: ./frontend
+    restart: unless-stopped
     working_dir: /app/frontend
-    volumes: [".:/app"]
-    command: sh -c "npm install && npm run dev -- --hostname 0.0.0.0"
-    ports: ["3000:3000"]
+    depends_on:
+      backend:
+        condition: service_healthy
+    volumes:
+      - ./frontend:/app/frontend
+      - frontend_node_modules:/app/frontend/node_modules
+      - frontend_next:/app/frontend/.next
+    ports:
+      - "${HOST_BIND_ADDRESS:-127.0.0.1}:3000:3000"
     environment:
       NEXT_PUBLIC_API_URL: http://localhost:8000/api
+      NEXT_TELEMETRY_DISABLED: "1"
+    healthcheck:
+      test:
+        - CMD
+        - node
+        - -e
+        - "fetch('http://127.0.0.1:3000/login').then(r => process.exit(r.ok ? 0 : 1)).catch(() => process.exit(1))"
+      interval: 15s
+      timeout: 5s
+      retries: 6
+      start_period: 30s
+
+volumes:
+  frontend_node_modules:
+  frontend_next:

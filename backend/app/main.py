@@ -3,6 +3,7 @@ import asyncio, logging
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 from app.core.config import get_settings
+from app.core.runtime_safety import validate_runtime_configuration
 from app.core.logging import configure_logging
 from app.db.base import Base
 from app.db.session import engine
@@ -16,6 +17,7 @@ from app.llm.factory import get_llm_provider
 configure_logging(); s=get_settings(); log=logging.getLogger(__name__)
 @asynccontextmanager
 async def lifespan(app:FastAPI):
+    validate_runtime_configuration(s)
     Base.metadata.create_all(bind=engine)
     # Preload local speech models once when they are configured; missing optional models never block mock mode.
     try:

@@ -28,6 +28,9 @@ AI Call Agent is a local-first CRM for one operator managing outbound calling. I
 - Starting a campaign requires an explicit compliance confirmation.
 - Settings must not reveal secrets.
 - Call/scheduler actions that bypass normal calling hours must be clearly identified as development tools.
+- Production startup rejects default or weak local credentials, weak JWT signing keys, and incomplete ChatGPT or Twilio configuration.
+- Twilio HTTP callbacks and Media Streams must carry valid signatures; Twilio endpoints are unavailable in mock mode.
+- Readiness reports database connectivity separately from process liveness; optional speech models do not block CRM readiness.
 
 ## Success criteria
 
