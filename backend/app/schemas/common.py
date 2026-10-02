@@ -93,6 +93,26 @@ class CallbackOut(ORMModel):
     status: str
     created_at: datetime
 
+class CallbackListOut(CallbackOut):
+    phone: str
+    company: str | None
+
+class CallbackStatsOut(BaseModel):
+    total: int
+    active: int
+    overdue: int
+    today: int
+    upcoming: int
+    completed: int
+
+class CallbackPageOut(BaseModel):
+    items: list[CallbackListOut]
+    total: int
+    page: int
+    page_size: int
+    page_count: int
+    stats: CallbackStatsOut
+
 class CampaignCreate(BaseModel):
     name: str = Field(min_length=1, max_length=200)
     description: str = ""

@@ -6,7 +6,7 @@ from zoneinfo import ZoneInfo
 from fastapi import APIRouter, Depends, UploadFile, File, HTTPException, WebSocket, Form, Query
 from fastapi.responses import Response, RedirectResponse
 from sqlalchemy.orm import Session, selectinload
-from sqlalchemy import select, func, or_, text, update, literal
+from sqlalchemy import select, func, or_, text, update, literal, case
 from sqlalchemy.dialects.sqlite import insert as sqlite_insert
 from sqlalchemy.exc import SQLAlchemyError
 from app.core.config import get_settings
@@ -270,10 +270,92 @@ def calls(
     }
     return {"items":rows,"total":total,"page":page,"page_size":page_size,"page_count":page_count,"stats":stats}
 
-@router.get("/callbacks", dependencies=[Depends(require_user)])
-def callbacks(db:Session=Depends(get_db)):
-    rows=db.execute(select(Callback,Lead.phone,Lead.company).join(Lead,Lead.id==Callback.lead_id).order_by(Callback.scheduled_at)).all()
-    return [{**CallbackOut.model_validate(callback).model_dump(),"phone":phone,"company":company} for callback,phone,company in rows]
+@router.get("/callbacks", response_model=CallbackPageOut, dependencies=[Depends(require_user)])
+def callbacks(
+    status: Literal["ACTIVE","COMPLETED","CANCELED"]|None=None,
+    search: str|None=Query(default=None,max_length=120),
+    page: int=Query(default=1,ge=1),
+    page_size: int=Query(default=25,ge=1,le=100),
+    db:Session=Depends(get_db),
+):
+    active_statuses=["SCHEDULED","DUE"]
+    filters=[]
+    if status=="ACTIVE":
+        filters.append(Callback.status.in_(active_statuses))
+    elif status:
+        filters.append(Callback.status==status)
+
+    query=(search or "").strip()
+    if query:
+        if S.database_url.startswith("sqlite"):
+            normalized=query.casefold()
+            filters.append(or_(
+                func.app_casefold(Callback.reason).contains(normalized,autoescape=True),
+                func.app_casefold(Lead.phone).contains(normalized,autoescape=True),
+                func.app_casefold(Lead.company).contains(normalized,autoescape=True),
+                func.app_casefold(Lead.name).contains(normalized,autoescape=True),
+            ))
+        else:
+            escaped=query.replace("\\","\\\\").replace("%","\\%").replace("_","\\_")
+            pattern=f"%{escaped}%"
+            filters.append(or_(
+                Callback.reason.ilike(pattern,escape="\\"),
+                Lead.phone.ilike(pattern,escape="\\"),
+                Lead.company.ilike(pattern,escape="\\"),
+                Lead.name.ilike(pattern,escape="\\"),
+            ))
+
+    total=db.scalar(select(func.count()).select_from(Callback).join(Lead,Lead.id==Callback.lead_id).where(*filters)) or 0
+    active=Callback.status.in_(active_statuses)
+    ordered=(
+        select(Callback,Lead.phone,Lead.company)
+        .join(Lead,Lead.id==Callback.lead_id)
+        .where(*filters)
+        .order_by(
+            case((active,0),else_=1),
+            case((active,Callback.scheduled_at),else_=None).asc().nulls_last(),
+            case((Callback.status.in_(["COMPLETED","CANCELED"]),Callback.created_at),else_=None).desc().nulls_last(),
+            Callback.id.desc(),
+        )
+        .offset((page-1)*page_size)
+        .limit(page_size)
+    )
+    rows=db.execute(ordered).all()
+    page_count=max(1,(total+page_size-1)//page_size)
+
+    now_utc=datetime.now(timezone.utc)
+    local_now=now_utc.astimezone(ZoneInfo(call_preferences(db)["timezone"]))
+    local_start=local_now.replace(hour=0,minute=0,second=0,microsecond=0)
+    day_start_utc=local_start.astimezone(timezone.utc)
+    day_end_utc=(local_start+timedelta(days=1)).astimezone(timezone.utc)
+    active_count=db.scalar(select(func.count()).select_from(Callback).where(active)) or 0
+    overdue_count=db.scalar(select(func.count()).select_from(Callback).where(
+        active,
+        or_(Callback.status=="DUE",Callback.scheduled_at<=now_utc),
+    )) or 0
+    today_count=db.scalar(select(func.count()).select_from(Callback).where(
+        Callback.status=="SCHEDULED",
+        Callback.scheduled_at>now_utc,
+        Callback.scheduled_at>=day_start_utc,
+        Callback.scheduled_at<day_end_utc,
+    )) or 0
+    completed_count=db.scalar(select(func.count()).select_from(Callback).where(Callback.status=="COMPLETED")) or 0
+    items=[{**CallbackOut.model_validate(callback).model_dump(),"phone":phone,"company":company} for callback,phone,company in rows]
+    return {
+        "items":items,
+        "total":total,
+        "page":page,
+        "page_size":page_size,
+        "page_count":page_count,
+        "stats":{
+            "total":db.scalar(select(func.count()).select_from(Callback)) or 0,
+            "active":active_count,
+            "overdue":overdue_count,
+            "today":today_count,
+            "upcoming":max(0,active_count-overdue_count-today_count),
+            "completed":completed_count,
+        },
+    }
 
 @router.patch("/callbacks/{callback_id}", response_model=CallbackOut, dependencies=[Depends(require_user)])
 def update_callback(callback_id:int,req:CallbackUpdate,db:Session=Depends(get_db)):

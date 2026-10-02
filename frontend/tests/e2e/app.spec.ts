@@ -31,7 +31,7 @@ async function fulfillJson(route: Route, value: unknown, status = 200) {
   });
 }
 
-async function mockApi(page: Page, options: { invalidLogin?: boolean; callsFailOnce?: boolean; extraCalls?: number } = {}): Promise<MockState> {
+async function mockApi(page: Page, options: { invalidLogin?: boolean; callsFailOnce?: boolean; extraCalls?: number; callbackFailOnce?: boolean; extraCallbacks?: number } = {}): Promise<MockState> {
   const requests: MockRequest[] = [];
   const leads: LeadMock[] = [
     { id: 42, phone: '+79991112233', name: 'Анна', company: 'Альфа', notes: 'Позвонить после обеда', status: 'CALLBACK', result: null, attempts: 2, created_at: futureIso(-20), updated_at: futureIso(-1), next_call_at: futureIso(1), last_call_at: futureIso(-2) },
@@ -42,6 +42,9 @@ async function mockApi(page: Page, options: { invalidLogin?: boolean; callsFailO
     { id: 6, lead_id: 43, call_id: null, reason: 'Обсудить предложение', scheduled_at: pastIso(), status: 'DUE', created_at: futureIso(-3), phone: '+79992223344', company: 'Бета' },
     { id: 7, lead_id: 43, call_id: null, reason: 'Больше не актуально', scheduled_at: futureIso(-2), status: 'CANCELED', created_at: futureIso(-4), phone: '+79992223344', company: 'Бета' },
   ];
+  for (let index = 0; index < (options.extraCallbacks || 0); index += 1) {
+    callbacks.push({ id: index + 100, lead_id: 42, call_id: null, reason: `Проверка callback ${index}`, scheduled_at: futureIso(index + 3), status: 'SCHEDULED', created_at: futureIso(-index - 5), phone: `+7999888${String(index).padStart(4, '0')}`, company: `Компания обратного звонка ${index}` });
+  }
   const calls: CallMock[] = [
     { id: 1, lead_id: 42, campaign_id: 1, phone: '+79991112233', started_at: futureIso(-1), answered_at: futureIso(-1), ended_at: futureIso(-1), duration: 104, status: 'COMPLETED', result: 'INTERESTED', summary: 'Договорились прислать предложение.', stt_ms: 180, llm_ms: 320, tts_ms: 210, total_ms: 710, transcripts: [{ id: 1, role: 'assistant', content: 'Добрый день! Удобно говорить?', timestamp: futureIso(-1) }, { id: 2, role: 'user', content: 'Да, расскажите подробнее.', timestamp: futureIso(-1) }] },
     { id: 2, lead_id: 43, campaign_id: 1, phone: '+79992223344', started_at: futureIso(-2), answered_at: null, ended_at: futureIso(-2), duration: 35, status: 'NO_ANSWER', result: 'No answer', summary: 'Абонент не ответил.', stt_ms: 0, llm_ms: 0, tts_ms: 0, total_ms: 0, transcripts: [] },
@@ -57,6 +60,7 @@ async function mockApi(page: Page, options: { invalidLogin?: boolean; callsFailO
   const health = { llm: { ok: true, provider: 'mock', detail: 'Тестовый провайдер отвечает' }, telephony: { ok: true, provider: 'mock', detail: 'Тестовые звонки включены' }, stt: { ok: false, provider: 'vosk', detail: 'Модель не настроена' }, tts: { ok: false, provider: 'piper', detail: { python: false, binary: false, model: '' } }, codex_on_path: false };
   let imported = false;
   let callsFailedOnce = false;
+  let callbacksFailedOnce = false;
 
   await page.route('**/api/**', async route => {
     const request = route.request();
@@ -157,7 +161,49 @@ async function mockApi(page: Page, options: { invalidLogin?: boolean; callsFailO
     }
     if (path === '/scheduler/tick' && method === 'POST') return fulfillJson(route, { processed: 1 });
 
-    if (path === '/callbacks' && method === 'GET') return fulfillJson(route, callbacks);
+    if (path === '/callbacks' && method === 'GET') {
+      if (options.callbackFailOnce && !callbacksFailedOnce) {
+        callbacksFailedOnce = true;
+        return fulfillJson(route, { detail: 'Service unavailable' }, 503);
+      }
+      const params = new URLSearchParams(url.search);
+      const search = (params.get('search') || '').toLocaleLowerCase('ru-RU');
+      const status = params.get('status') || '';
+      const pageNumber = Number(params.get('page') || 1);
+      const pageSize = Number(params.get('page_size') || 25);
+      const filtered = callbacks.filter(callback => {
+        const matchesStatus = !status || (status === 'ACTIVE'
+          ? ['SCHEDULED', 'DUE'].includes(callback.status)
+          : callback.status === status);
+        const haystack = `${callback.company || ''} ${callback.phone || ''} ${callback.reason || ''}`.toLocaleLowerCase('ru-RU');
+        return matchesStatus && (!search || haystack.includes(search));
+      }).sort((left, right) => {
+        const leftActive = ['SCHEDULED', 'DUE'].includes(left.status);
+        const rightActive = ['SCHEDULED', 'DUE'].includes(right.status);
+        if (leftActive !== rightActive) return leftActive ? -1 : 1;
+        if (leftActive) return Date.parse(left.scheduled_at) - Date.parse(right.scheduled_at) || left.id - right.id;
+        return Date.parse(right.created_at) - Date.parse(left.created_at) || right.id - left.id;
+      });
+      const active = callbacks.filter(callback => ['SCHEDULED', 'DUE'].includes(callback.status));
+      const now = Date.now();
+      const overdue = active.filter(callback => callback.status === 'DUE' || Date.parse(callback.scheduled_at) <= now).length;
+      const today = active.filter(callback => callback.status === 'SCHEDULED' && Date.parse(callback.scheduled_at) > now && new Date(callback.scheduled_at).toDateString() === new Date().toDateString()).length;
+      return fulfillJson(route, {
+        items: filtered.slice((pageNumber - 1) * pageSize, pageNumber * pageSize),
+        total: filtered.length,
+        page: pageNumber,
+        page_size: pageSize,
+        page_count: Math.max(1, Math.ceil(filtered.length / pageSize)),
+        stats: {
+          total: callbacks.length,
+          active: active.length,
+          overdue,
+          today,
+          upcoming: Math.max(0, active.length - overdue - today),
+          completed: callbacks.filter(callback => callback.status === 'COMPLETED').length,
+        },
+      });
+    }
     const callbackMatch = path.match(/^\/callbacks\/(\d+)$/);
     if (callbackMatch && method === 'PATCH') {
       const callback = callbacks.find(item => item.id === Number(callbackMatch[1]));
@@ -213,7 +259,7 @@ async function mockApi(page: Page, options: { invalidLogin?: boolean; callsFailO
   return { requests, leads, callbacks, calls, campaigns, settings };
 }
 
-async function enterWorkspace(page: Page, options: { callsFailOnce?: boolean; extraCalls?: number } = {}): Promise<MockState> {
+async function enterWorkspace(page: Page, options: { callsFailOnce?: boolean; extraCalls?: number; callbackFailOnce?: boolean; extraCallbacks?: number } = {}): Promise<MockState> {
   await page.addInitScript(() => localStorage.setItem('token', 'test-token'));
   return mockApi(page, options);
 }
@@ -341,6 +387,33 @@ test('callbacks can be rescheduled, completed, and canceled', async ({ page }) =
   await page.getByRole('button', { name: 'Отменить обратный звонок #6' }).click();
   await page.getByRole('button', { name: 'Отменить звонок' }).click();
   expect(mocks.callbacks.find(item => item.id === 6)?.status).toBe('CANCELED');
+});
+
+test('callback queue paginates and searches on the server, with a distinct no-results state', async ({ page }) => {
+  const mocks = await enterWorkspace(page, { extraCallbacks: 24 });
+  await page.goto('/callbacks');
+  await expect(page.locator('.table-toolbar .table-count')).toHaveText('1–20 из 26');
+  await page.getByRole('button', { name: 'Вперёд' }).click();
+  await expect(page.locator('.table-toolbar .table-count')).toHaveText('21–26 из 26');
+  expect(mocks.requests.some(request => request.path === '/callbacks' && new URLSearchParams(request.search).get('status') === 'ACTIVE' && new URLSearchParams(request.search).get('page') === '2')).toBe(true);
+
+  const search = page.getByLabel('Поиск по компании, телефону или причине');
+  await search.fill('Компания обратного звонка 23');
+  await expect(page.getByRole('link', { name: 'Компания обратного звонка 23' })).toBeVisible();
+  await expect(page.locator('.table-toolbar .table-count')).toHaveText('1–1 из 1');
+  await expect.poll(() => mocks.requests.some(request => request.path === '/callbacks' && new URLSearchParams(request.search).get('search') === 'Компания обратного звонка 23')).toBe(true);
+
+  await search.fill('Нет такой компании');
+  await expect(page.getByText('Задач не найдено')).toBeVisible();
+  await expect(page.getByText('Очередь свободна')).toHaveCount(0);
+});
+
+test('callback queue shows API failures and retries successfully', async ({ page }) => {
+  await enterWorkspace(page, { callbackFailOnce: true });
+  await page.goto('/callbacks');
+  await expect(page.locator('.notice-danger').filter({ hasText: 'Не удалось выполнить запрос' })).toBeVisible();
+  await page.getByRole('button', { name: 'Повторить' }).click();
+  await expect(page.getByRole('link', { name: 'Альфа' })).toBeVisible();
 });
 
 test('campaign creation requires compliance before start and confirms scheduler override', async ({ page }) => {

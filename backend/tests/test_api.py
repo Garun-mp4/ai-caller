@@ -42,9 +42,107 @@ def test_callback_can_be_rescheduled_and_completed(db):
         db.refresh(lead)
         assert lead.status=="DONE"
         assert lead.next_call_at is None
-        listed=c.get('/api/callbacks',headers=h).json()[0]
+        listed=c.get('/api/callbacks',headers=h).json()['items'][0]
         assert listed['company']=="Альфа"
         assert listed['phone']==lead.phone
+
+def test_callbacks_are_paginated_filtered_and_searchable(db):
+    scheduled=datetime.now(timezone.utc)+timedelta(days=2)
+    leads=[]
+    callbacks=[]
+    for index in range(205):
+        lead=Lead(
+            phone=f"+7999777{index:04d}",
+            name="Избранный клиент" if index==204 else f"Клиент {index}",
+            company="ООО Ёлка 204" if index==204 else f"Компания {index}",
+            status="CALLBACK",
+        )
+        leads.append(lead)
+    db.add_all(leads); db.flush()
+    for index,lead in enumerate(leads):
+        status="COMPLETED" if index==1 else "CANCELED" if index==2 else "DUE" if index==0 else "SCHEDULED"
+        reason="Найти 100% решение" if index==204 else f"Связаться {index}"
+        callbacks.append(Callback(
+            lead_id=lead.id,
+            reason=reason,
+            scheduled_at=scheduled+timedelta(minutes=index),
+            status=status,
+        ))
+    db.add_all(callbacks); db.commit()
+
+    with TestClient(app) as c:
+        h=auth(c)
+        second=c.get('/api/callbacks',params={'page':2,'page_size':50},headers=h)
+        assert second.status_code==200
+        payload=second.json()
+        assert (payload['total'],payload['page'],payload['page_size'],payload['page_count'])==(205,2,50,5)
+        assert len(payload['items'])==50
+        assert payload['items'][0]['status'] in ('SCHEDULED','DUE')
+        assert payload['stats']['total']==205
+        assert payload['stats']['active']==203
+        assert payload['stats']['completed']==1
+
+        last=c.get('/api/callbacks',params={'page':5,'page_size':50},headers=h).json()
+        assert len(last['items'])==5
+        assert {row['status'] for row in last['items'][-2:]}=={'COMPLETED','CANCELED'}
+
+        active=c.get('/api/callbacks',params={'status':'ACTIVE','page_size':100},headers=h).json()
+        assert active['total']==203
+        assert all(row['status'] in ('SCHEDULED','DUE') for row in active['items'])
+        completed=c.get('/api/callbacks',params={'status':'COMPLETED'},headers=h).json()
+        assert completed['total']==1 and completed['items'][0]['status']=='COMPLETED'
+
+        by_name=c.get('/api/callbacks',params={'search':'изБРаНный'},headers=h).json()
+        assert by_name['total']==1 and by_name['items'][0]['lead_id']==leads[204].id
+        by_reason=c.get('/api/callbacks',params={'search':'%'},headers=h).json()
+        assert by_reason['total']==1 and by_reason['items'][0]['reason']=='Найти 100% решение'
+        assert by_reason['stats']['total']==205
+        assert c.get('/api/callbacks',params={'page':0},headers=h).status_code==422
+        assert c.get('/api/callbacks',params={'page_size':101},headers=h).status_code==422
+        assert c.get('/api/callbacks',params={'status':'UNKNOWN'},headers=h).status_code==422
+
+def test_callback_stats_use_configured_timezone_and_exclusive_buckets(db,monkeypatch):
+    from app.api import routes
+    from zoneinfo import ZoneInfo
+
+    timezone_name="Europe/Astrakhan"
+    local_now=datetime.now(timezone.utc).astimezone(ZoneInfo(timezone_name))
+    local_tomorrow=local_now.replace(hour=0,minute=0,second=0,microsecond=0)+timedelta(days=1)
+    fixed_now=local_tomorrow.replace(hour=21).astimezone(timezone.utc)
+    class FrozenDateTime(datetime):
+        @classmethod
+        def now(cls,tz=None):
+            return fixed_now.astimezone(tz) if tz else fixed_now.replace(tzinfo=None)
+
+    monkeypatch.setattr(routes,"datetime",FrozenDateTime)
+    assert routes.datetime.now(timezone.utc)==fixed_now
+    db.add(AppSetting(key="timezone",value=timezone_name))
+    db.flush()
+    schedules=[
+        ("DUE",fixed_now+timedelta(minutes=10)),
+        ("SCHEDULED",fixed_now-timedelta(minutes=10)),
+        ("SCHEDULED",fixed_now+timedelta(minutes=15)),
+        ("SCHEDULED",fixed_now+timedelta(hours=4)),
+        ("COMPLETED",fixed_now+timedelta(minutes=20)),
+        ("CANCELED",fixed_now+timedelta(minutes=20)),
+    ]
+    for index,(status,scheduled_at) in enumerate(schedules):
+        lead=Lead(phone=f"+7999666{index:04d}",company=f"Часовой пояс {index}",status="CALLBACK")
+        db.add(lead); db.flush()
+        db.add(Callback(lead_id=lead.id,reason="Проверка времени",scheduled_at=scheduled_at,status=status))
+    db.commit()
+
+    with TestClient(app) as c:
+        payload=c.get('/api/callbacks',params={'status':'ACTIVE','search':'нет совпадения'},headers=auth(c)).json()
+        assert payload['items']==[] and payload['total']==0
+        assert payload['stats']=={
+            'total':6,
+            'active':4,
+            'overdue':2,
+            'today':1,
+            'upcoming':1,
+            'completed':1,
+        }
 
 def test_dnc_cancels_callback_and_prevents_rescheduling(db):
     lead,callback=_lead_with_callback(db,"+79992223344")
