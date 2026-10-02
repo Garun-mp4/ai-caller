@@ -137,6 +137,18 @@ PIPER_CONFIG_PATH=/absolute/path/to/ru_voice.onnx.json
 
 The preferred `piper-tts` Python path loads `PiperVoice` once per backend process and reuses it for every utterance. A safe `shell=False` Piper CLI fallback is retained for compatibility, but the in-process provider is recommended for low latency. In mock telephony mode Piper is not needed.
 
+## Audio and speech-model checks
+
+The backend suite covers PCM16/µ-law conversion, resampling, voice activity detection, bounded speech buffering, Twilio media-stream turns, barge-in, and Piper CLI cleanup. Two short Russian recordings from Google’s [FLEURS-R development split](https://huggingface.co/datasets/google/fleurs-r) are included under `backend/tests/assets/fleurs-ru-dev`; they are attributed and licensed CC BY 4.0 in that directory's README.
+
+For actual inference checks, place the optional model files at the paths below. The Vosk catalog lists `vosk-model-small-ru-0.22` at about 45 MB under Apache 2.0. The Piper `ru_RU-dmitri-medium` voice is about 63 MB; its [model card](https://huggingface.co/rhasspy/piper-voices/blob/v1.0.0/ru/ru_RU/dmitri/medium/MODEL_CARD) identifies its training dataset as CC0, and the pinned model files are from the `v1.0.0` voice release. These weights are ignored by Git and are not included in the repository.
+
+- Download the [Russian Vosk small model](https://alphacephei.com/vosk/models/vosk-model-small-ru-0.22.zip), unpack it to `models/vosk/model`.
+- Download the [Piper ONNX voice](https://huggingface.co/rhasspy/piper-voices/resolve/v1.0.0/ru/ru_RU/dmitri/medium/ru_RU-dmitri-medium.onnx) and [matching JSON config](https://huggingface.co/rhasspy/piper-voices/resolve/v1.0.0/ru/ru_RU/dmitri/medium/ru_RU-dmitri-medium.onnx.json), then save them as `models/piper/voice.onnx` and `models/piper/voice.onnx.json`.
+- Run `docker compose exec -T backend pytest -m model_integration -q` for warm-up, health, FLEURS-R transcription, Piper synthesis, and Piper-to-Vosk recognition checks.
+
+The full backend test run also executes these model checks when model files are present and skips only the model-dependent cases when they are absent. Model inference requires additional memory and takes longer than the unit suite.
+
 ## Codex CLI setup/login
 
 Install the **official Codex CLI**, ensure `codex` is available on `PATH`, and use its official login flow. Then set:

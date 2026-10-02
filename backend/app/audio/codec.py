@@ -25,10 +25,13 @@ def pcm16_to_mulaw_sample(sample: int) -> int:
     return (~(sign | (exponent<<4) | mantissa)) & 0xFF
 
 def pcm16_to_mulaw(data: bytes) -> bytes:
-    samples=struct.unpack("<"+"h"*(len(data)//2), data[:len(data)//2*2])
+    if len(data) % 2:
+        raise ValueError("PCM16 audio must contain complete 16-bit samples")
+    samples=struct.unpack("<"+"h"*(len(data)//2), data)
     return bytes(pcm16_to_mulaw_sample(s) for s in samples)
 
 def wav_to_pcm16(wav_bytes: bytes):
     with wave.open(io.BytesIO(wav_bytes), "rb") as w:
-        if w.getsampwidth()!=2 or w.getnchannels()!=1: raise ValueError("Piper WAV must be mono PCM16")
+        if w.getcomptype() != "NONE" or w.getsampwidth()!=2 or w.getnchannels()!=1:
+            raise ValueError("Audio WAV must be uncompressed mono PCM16")
         return w.readframes(w.getnframes()), w.getframerate()

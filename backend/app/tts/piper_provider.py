@@ -55,13 +55,14 @@ class PiperProvider(TTSProvider):
         # Compatibility fallback. The preferred piper-tts path above keeps the model resident in memory.
         with tempfile.NamedTemporaryFile(suffix=".wav", delete=False) as f:
             out_path=f.name
-        args=[self.binary,"--model",self.model,"--output_file",out_path]
-        if self.config and os.path.isfile(self.config): args += ["--config", self.config]
-        proc=await asyncio.create_subprocess_exec(*args, stdin=asyncio.subprocess.PIPE, stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE)
-        _,err=await proc.communicate(text.encode("utf-8"))
-        if proc.returncode != 0: raise RuntimeError(err.decode(errors="ignore")[-500:])
         try:
-            return open(out_path,"rb").read()
+            args=[self.binary,"--model",self.model,"--output_file",out_path]
+            if self.config and os.path.isfile(self.config): args += ["--config", self.config]
+            proc=await asyncio.create_subprocess_exec(*args, stdin=asyncio.subprocess.PIPE, stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE)
+            _,err=await proc.communicate(text.encode("utf-8"))
+            if proc.returncode != 0: raise RuntimeError(err.decode(errors="ignore")[-500:])
+            with open(out_path,"rb") as wav_file:
+                return wav_file.read()
         finally:
             try: os.unlink(out_path)
             except OSError: pass

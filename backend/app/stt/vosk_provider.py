@@ -21,9 +21,25 @@ class VoskProvider(STTProvider):
         self._ensure_model()
         return self
     def transcribe_pcm16(self, pcm: bytes, sample_rate: int = 16000) -> str:
+        if sample_rate <= 0:
+            raise ValueError("Sample rate must be positive")
+        if len(pcm) % 2:
+            raise ValueError("PCM16 audio must contain complete 16-bit samples")
+        if not pcm:
+            return ""
+
         from vosk import KaldiRecognizer
         rec = KaldiRecognizer(self._ensure_model(), sample_rate)
-        rec.AcceptWaveform(pcm)
-        return json.loads(rec.FinalResult()).get("text", "").strip()
+        recognized = []
+        # Feed bounded frames so endpoint detection can split longer utterances.
+        for offset in range(0, len(pcm), 4000):
+            if rec.AcceptWaveform(pcm[offset:offset + 4000]):
+                text = json.loads(rec.Result()).get("text", "").strip()
+                if text:
+                    recognized.append(text)
+        final_text = json.loads(rec.FinalResult()).get("text", "").strip()
+        if final_text:
+            recognized.append(final_text)
+        return " ".join(recognized)
     def health(self):
         return {"ok": os.path.isdir(self.path), "detail": self.path}
