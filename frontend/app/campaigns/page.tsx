@@ -7,6 +7,7 @@ import { Empty, friendlyError, Header, Icon, Loading, Notice, StatusBadge } from
 
 type Campaign = { id: number; name: string; description: string; agent_prompt: string; status: string; metrics: Record<string, number> };
 type CampaignForm = { name: string; description: string; agent_prompt: string };
+type AudiencePreview = { to_attach: number; already_attached: number; attached_eligible: number; by_status: Record<string, number> };
 const metricLabels: Record<string, string> = { total: 'Лидов', queued: 'В очереди', calling: 'Звонят', answered: 'Ответили', no_answer: 'Нет ответа', interested: 'С интересом', hot_leads: 'Горячие' };
 
 export default function Campaigns() {
@@ -16,6 +17,9 @@ export default function Campaigns() {
   const [feedback, setFeedback] = useState<{ tone: 'success' | 'danger'; text: string } | null>(null);
   const [workingId, setWorkingId] = useState<number | null>(null);
   const [confirmed, setConfirmed] = useState<Record<number, boolean>>({});
+  const [audiences, setAudiences] = useState<Record<number, AudiencePreview>>({});
+  const [audienceReviewed, setAudienceReviewed] = useState<Record<number, boolean>>({});
+  const [previewingId, setPreviewingId] = useState<number | null>(null);
   const [formOpen, setFormOpen] = useState(false);
   const [form, setForm] = useState<CampaignForm>({ name: '', description: '', agent_prompt: '' });
   const [creating, setCreating] = useState(false);
@@ -43,14 +47,30 @@ export default function Campaigns() {
     finally { setCreating(false); }
   }
 
+  async function previewAudience(campaign: Campaign) {
+    setPreviewingId(campaign.id); setFeedback(null);
+    setConfirmed(current => ({ ...current, [campaign.id]: false }));
+    setAudienceReviewed(current => ({ ...current, [campaign.id]: false }));
+    try {
+      const preview = await api<AudiencePreview>(`/campaigns/${campaign.id}/audience`);
+      setAudiences(current => ({ ...current, [campaign.id]: preview }));
+      setAudienceReviewed(current => ({ ...current, [campaign.id]: true }));
+    } catch (requestError) {
+      setFeedback({ tone: 'danger', text: friendlyError(requestError) });
+    } finally { setPreviewingId(null); }
+  }
+
   async function campaignAction(campaign: Campaign, action: 'start' | 'pause' | 'stop') {
     setWorkingId(campaign.id); setFeedback(null); setError('');
     try {
       if (action === 'start') {
         if (!confirmed[campaign.id]) throw new Error('Compliance confirmation is required');
+        if (!audienceReviewed[campaign.id]) throw new Error('Сначала проверьте аудиторию кампании.');
         const attached = await api<{ attached: number }>(`/campaigns/${campaign.id}/attach-all`, { method: 'POST' });
         await api(`/campaigns/${campaign.id}/start`, { method: 'POST', body: JSON.stringify({ confirm_compliance: true }) });
         setFeedback({ tone: 'success', text: `Кампания запущена. Добавлено контактов: ${attached.attached}. Подтверждение права на связь сохранено.` });
+        setAudiences(current => { const next = { ...current }; delete next[campaign.id]; return next; });
+        setAudienceReviewed(current => ({ ...current, [campaign.id]: false }));
       } else {
         await api(`/campaigns/${campaign.id}/${action}`, { method: 'POST' });
         setFeedback({ tone: 'success', text: action === 'pause' ? 'Кампания приостановлена.' : 'Кампания остановлена.' });
@@ -94,17 +114,24 @@ export default function Campaigns() {
         const canStart = ['DRAFT', 'PAUSED'].includes(campaign.status);
         const canPause = campaign.status === 'RUNNING';
         const canStop = !['STOPPED', 'DRAFT'].includes(campaign.status);
+        const audience = audiences[campaign.id];
+        const hasCallableAudience = Boolean(audience && audience.to_attach + audience.attached_eligible > 0);
         return <article className="card campaign-card" key={campaign.id}>
           <div className="campaign-topline">
             <div><h2 className="campaign-name">{campaign.name} <StatusBadge status={campaign.status}/></h2><p className="campaign-copy">{campaign.description || 'Описание не добавлено.'}</p></div>
             <div className="campaign-actions">
-              {canStart && <button type="button" className="btn btn-primary" onClick={() => void campaignAction(campaign, 'start')} disabled={!confirmed[campaign.id] || workingId === campaign.id}><Icon name="play"/>{workingId === campaign.id ? 'Запускаем…' : 'Запустить'}</button>}
+              {canStart && <button type="button" className="btn btn-primary" onClick={() => void campaignAction(campaign, 'start')} disabled={!confirmed[campaign.id] || !audienceReviewed[campaign.id] || !hasCallableAudience || workingId === campaign.id}><Icon name="play"/>{workingId === campaign.id ? 'Запускаем…' : 'Запустить'}</button>}
               {canPause && <button type="button" className="btn" onClick={() => void campaignAction(campaign, 'pause')} disabled={workingId === campaign.id}><Icon name="pause"/>Приостановить</button>}
               {canStop && <button type="button" className="btn btn-danger" onClick={() => setStopTarget(campaign)} disabled={workingId === campaign.id}><Icon name="stop"/>Остановить</button>}
             </div>
           </div>
           <div className="campaign-metrics">{Object.entries(metricLabels).map(([key, label]) => <div className="campaign-metric" key={key}><span>{label}</span><strong>{metrics[key] ?? 0}</strong></div>)}</div>
-          {canStart && <label className="checkbox-row" style={{ marginTop: 14 }}><input type="checkbox" checked={Boolean(confirmed[campaign.id])} onChange={event => setConfirmed(value => ({ ...value, [campaign.id]: event.target.checked }))}/><span>Я имею право связываться с выбранными лидами и буду соблюдать требования к телемаркетингу и защите персональных данных. Запуск добавит в очередь все доступные контакты, кроме «Не звонить».</span></label>}
+          {canStart && <div className="campaign-audience-review">
+            <button type="button" className="btn btn-ghost btn-sm" onClick={() => void previewAudience(campaign)} disabled={previewingId === campaign.id}><Icon name="users"/>{previewingId === campaign.id ? 'Проверяем…' : audienceReviewed[campaign.id] ? 'Обновить аудиторию' : 'Проверить аудиторию'}</button>
+            {audienceReviewed[campaign.id] && audience && <p className="field-hint" role="status">К добавлению: {audience.to_attach}; уже подходят в кампании: {audience.attached_eligible}; прикреплено всего: {audience.already_attached}. В разрезе: новые — {audience.by_status.NEW || 0}, в очереди — {audience.by_status.QUEUED || 0}, обратные звонки — {audience.by_status.CALLBACK || 0}. Запрет «Не звонить» исключается автоматически.</p>}
+            {audienceReviewed[campaign.id] && !hasCallableAudience && <div className="notice notice-warning">Подходящих контактов пока нет. Добавьте новых лидов или проверьте статус кампании.</div>}
+            <label className="checkbox-row"><input type="checkbox" checked={Boolean(confirmed[campaign.id])} disabled={!audienceReviewed[campaign.id] || !hasCallableAudience} onChange={event => setConfirmed(value => ({ ...value, [campaign.id]: event.target.checked }))}/><span>Я проверил аудиторию, имею право связываться с этими лидами и буду соблюдать требования к телемаркетингу и защите персональных данных.</span></label>
+          </div>}
           {campaign.agent_prompt && <details style={{ marginTop: 12 }}><summary className="btn btn-ghost btn-sm">Инструкция AI-агенту</summary><p className="call-summary">{campaign.agent_prompt}</p></details>}
         </article>;
       })}

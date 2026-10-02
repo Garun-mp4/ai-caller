@@ -4,15 +4,15 @@ from app.core.config import get_settings
 from app.services.settings_service import runtime_setting
 
 class PiperProvider(TTSProvider):
-    _voice = None
-    _lock = threading.Lock()
     def __init__(self):
         s=get_settings(); self.binary=shutil.which(s.piper_binary); self.model=runtime_setting("piper_model_path", s.piper_model_path); self.config=s.piper_config_path
+        self._voice = None
+        self._lock = threading.Lock()
 
     def _ensure_voice(self):
-        if self.__class__._voice is None:
-            with self.__class__._lock:
-                if self.__class__._voice is None:
+        if self._voice is None:
+            with self._lock:
+                if self._voice is None:
                     if not os.path.isfile(self.model):
                         raise RuntimeError(f"Piper model not found: {self.model}")
                     try:
@@ -24,8 +24,8 @@ class PiperProvider(TTSProvider):
                             raise RuntimeError("piper-tts Python package is not installed") from e
                     kwargs={}
                     if self.config and os.path.isfile(self.config): kwargs["config_path"]=self.config
-                    self.__class__._voice=PiperVoice.load(self.model, **kwargs)
-        return self.__class__._voice
+                    self._voice=PiperVoice.load(self.model, **kwargs)
+        return self._voice
 
     def preload(self):
         self._ensure_voice(); return self

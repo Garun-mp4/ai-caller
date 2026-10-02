@@ -22,9 +22,9 @@ const agentFields = [
 const callFields = [
   { key: 'calling_hours', label: 'Разрешённое время звонков', hint: 'Например, 09:00-18:00' },
   { key: 'timezone', label: 'Часовой пояс' },
-  { key: 'max_attempts', label: 'Попыток на контакт', type: 'number', min: 1, max: 20 },
-  { key: 'delay_between_attempts', label: 'Пауза между попытками (мин)', type: 'number', min: 0, max: 1440 },
-  { key: 'max_concurrent_calls', label: 'Одновременных звонков', type: 'number', min: 1, max: 20 },
+  { key: 'max_attempts', label: 'Попыток на контакт', type: 'number', min: 1, max: 50 },
+  { key: 'delay_between_attempts', label: 'Пауза между попытками (мин)', type: 'number', min: 1, max: 10080 },
+  { key: 'max_concurrent_calls', label: 'Одновременных звонков', type: 'number', min: 1, max: 25 },
 ];
 const providerRows = [
   ['llm', 'Модель диалога'], ['telephony', 'Телефония'], ['stt', 'Распознавание речи'], ['tts', 'Синтез речи'],
@@ -97,7 +97,8 @@ export default function Settings() {
     if (!data || !isDirty) return;
     setSaving(true); setFeedback(null); setError('');
     try {
-      await api('/settings', { method: 'PUT', body: JSON.stringify(data.values) });
+      const changes = Object.fromEntries(Object.entries(data.values).filter(([key, value]) => initialValues[key] !== value));
+      await api('/settings', { method: 'PUT', body: JSON.stringify(changes) });
       setInitialValues({ ...data.values });
       setFeedback({ tone: 'success', text: 'Настройки сохранены.' });
     } catch (requestError) { setFeedback({ tone: 'danger', text: friendlyError(requestError) }); }
@@ -125,11 +126,11 @@ export default function Settings() {
           <div className="notice notice-info" style={{ marginTop: 15 }}><Icon name="info"/><span>Часы звонков применяются планировщиком. Тестовый ручной шаг в разделе кампаний их обходит.</span></div>
         </section>
         <section className="card settings-section">
-          <div className="section-heading"><div><h2 className="section-title">Модели и локальные файлы</h2><p className="section-description">Изменения провайдеров применятся после перезапуска backend.</p></div></div>
+          <div className="section-heading"><div><h2 className="section-title">Модели и локальные файлы</h2><p className="section-description">После сохранения новые вызовы сразу используют обновлённые настройки.</p></div></div>
           <div className="settings-fields">
             <label className="field"><span className="field-label">Провайдер диалога</span><select className="select" value={settings.llm_provider || 'mock'} onChange={event => setValue('llm_provider', event.target.value)}><option value="mock">Тестовый режим</option><option value="codex">Codex</option></select></label>
             <Field label="Модель диалога" value={settings.llm_model || ''} onChange={value => setValue('llm_model', value)}/>
-            <Field label="Уровень рассуждения" value={settings.reasoning_effort || ''} onChange={value => setValue('reasoning_effort', value)}/>
+            <label className="field"><span className="field-label">Уровень рассуждения</span><select className="select" value={settings.reasoning_effort || 'low'} onChange={event => setValue('reasoning_effort', event.target.value)}><option value="low">Низкий</option><option value="medium">Средний</option><option value="high">Высокий</option><option value="xhigh">Очень высокий</option></select></label>
             <Field label="Путь к модели распознавания (Vosk)" value={settings.vosk_model_path || ''} onChange={value => setValue('vosk_model_path', value)} wide hint="Путь на компьютере, где запущен backend."/>
             <Field label="Путь к модели голоса (Piper)" value={settings.piper_model_path || ''} onChange={value => setValue('piper_model_path', value)} wide hint="Путь на компьютере, где запущен backend."/>
           </div>

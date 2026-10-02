@@ -14,7 +14,7 @@ Local-first SaaS-style MVP for managing phone leads, campaigns, callbacks and AI
 - Call history, transcripts, summaries and latency fields.
 - Mock LLM and mock telephony for free local E2E development.
 - Codex CLI provider isolated behind `LLMProvider`, executed asynchronously with `shell=False` and a timeout.
-- Vosk provider with the model cached process-wide and loaded only once on first use.
+- Vosk provider caches its loaded model per provider instance and path.
 - Piper provider isolated behind `TTSProvider`.
 - Twilio outbound call provider plus Media Streams WebSocket, µ-law/PCM conversion, simple VAD and barge-in (`clear` on detected speech).
 - `HotLeadCreated` persisted event seam for a future Telegram notification handler. Telegram itself is intentionally not implemented.
@@ -28,6 +28,10 @@ Live audio path:
 `Twilio Media Stream -> audio codec/resampler/VAD -> Vosk -> LLMProvider -> structured decision -> Piper -> µ-law -> Twilio`
 
 The live WebSocket is intentionally thin: audio, STT, LLM and TTS are separate modules. Mock mode exercises the CRM/campaign lifecycle without requiring audio binaries or external accounts.
+
+## API contracts
+
+`GET /api/leads` returns a page object with `items`, `total`, `page`, `page_size` and `page_count`. It supports `status`, `campaign`, `search`, `page`, `page_size` (1–100), `sort_by` and `sort_order`; search covers contact name, company and phone. Campaigns can preview the number of eligible contacts at `GET /api/campaigns/{id}/audience`; attachment only includes `NEW`, `QUEUED` and `CALLBACK` leads, so completed and `DO_NOT_CALL` contacts stay out of the queue.
 
 ## Requirements
 
@@ -86,7 +90,7 @@ AUTH_MODE=local
 
 1. Sign in.
 2. Open **Leads** and import a TXT file, e.g. one E.164 number per line.
-3. Open **Campaigns**, create a campaign and click Start. Starting records the compliance confirmation.
+3. Open **Campaigns**, create a campaign, review its eligible audience and confirm contact authorization before starting.
 4. Click **Run one scheduler tick** to immediately process a queued lead even if you are outside calling hours. The background scheduler itself respects configured calling hours.
 5. Inspect Calls, Lead Details and Callbacks.
 
@@ -175,7 +179,7 @@ The media layer decodes Twilio µ-law/8 kHz, resamples to 16 kHz for Vosk, detec
 
 ## Settings
 
-The Settings page exposes non-secret model/provider configuration plus editable agent/call preferences. Secret values such as Twilio tokens are never sent to the frontend. Model/provider path changes are persisted and take effect after a backend restart because Vosk/Piper/LLM providers are intentionally process-cached; calling-hour/attempt settings are read dynamically.
+The Settings page exposes non-secret model/provider configuration plus editable agent/call preferences. Secret values such as Twilio tokens are never sent to the frontend. Provider, model and model-path changes clear the relevant cached provider; new calls use the updated settings immediately. Loaded speech models remain attached to the in-flight provider instance until active work releases it. Calling-hour and attempt settings are read dynamically, and invalid legacy values are displayed using their safe effective values.
 
 ## Tests
 
@@ -208,7 +212,7 @@ npm run build
 
 The frontend browser suite runs against a local Next.js server and mocks the API, so it does not make real calls or require provider credentials. Install its browser once with `npx playwright install chromium`.
 
-Tests cover TXT import, duplicate detection, phone validation, structured agent output, mock LLM, mock telephony, campaign compliance, scheduler/callback flow and DO_NOT_CALL exclusion.
+Tests cover TXT import, duplicate detection, phone validation, paginated and sorted lead queries, settings validation and secret filtering, campaign audience eligibility, duplicate scheduler ticks, stale call reservations, Twilio callback idempotency, structured agent output, mock providers and DO_NOT_CALL exclusion.
 
 ## Production considerations
 

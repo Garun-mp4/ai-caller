@@ -1,10 +1,13 @@
-from datetime import datetime, timezone
+from datetime import datetime, timezone, timedelta
 import logging
 import shutil
-from fastapi import APIRouter, Depends, UploadFile, File, HTTPException, WebSocket, Form
+from typing import Literal
+from zoneinfo import ZoneInfo
+from fastapi import APIRouter, Depends, UploadFile, File, HTTPException, WebSocket, Form, Query
 from fastapi.responses import Response, RedirectResponse
 from sqlalchemy.orm import Session, selectinload
-from sqlalchemy import select, func, or_, text
+from sqlalchemy import select, func, or_, text, update, literal
+from sqlalchemy.dialects.sqlite import insert as sqlite_insert
 from sqlalchemy.exc import SQLAlchemyError
 from app.core.config import get_settings
 from app.core.security import create_token, require_user
@@ -18,9 +21,9 @@ from app.llm.factory import get_llm_provider
 from app.telephony.factory import get_telephony_provider
 from app.stt.factory import get_stt_provider
 from app.tts.factory import get_tts_provider
-from app.services.call_service import initiate_call, apply_decision
+from app.services.call_service import initiate_call, apply_decision, CallNotEligibleError
 from app.agent.prompt import build_sales_prompt, configured_introduction
-from app.services.settings_service import call_preferences
+from app.services.settings_service import call_preferences, runtime_setting, invalidate_runtime_providers
 from app.telephony.media_stream import handle_twilio_media
 from app.telephony.request_validation import validate_twilio_request, validate_twilio_websocket
 
@@ -66,12 +69,16 @@ async def chatgpt_callback(code: str, state: str):
 
 @router.get("/dashboard", dependencies=[Depends(require_user)])
 def dashboard(db: Session=Depends(get_db)):
-    today=datetime.now(timezone.utc).date()
+    pref=call_preferences(db)
+    local_now=datetime.now(ZoneInfo(pref["timezone"]))
+    local_start=local_now.replace(hour=0,minute=0,second=0,microsecond=0)
+    day_start=local_start.astimezone(timezone.utc)
+    day_end=(local_start+timedelta(days=1)).astimezone(timezone.utc)
     leads=db.scalar(select(func.count()).select_from(Lead)) or 0
-    calls=db.scalars(select(Call).order_by(Call.id.desc()).limit(6)).all()
+    calls=db.scalars(select(Call).options(selectinload(Call.transcripts)).order_by(Call.id.desc()).limit(6)).all()
     callbacks=db.scalars(select(Callback).where(Callback.status.in_(["SCHEDULED","DUE"])).order_by(Callback.scheduled_at).limit(6)).all()
     statuses=dict(db.execute(select(Lead.status,func.count()).group_by(Lead.status)).all())
-    calls_today=sum(1 for c in db.scalars(select(Call)).all() if c.started_at.date()==today)
+    calls_today=db.scalar(select(func.count()).select_from(Call).where(Call.started_at>=day_start,Call.started_at<day_end)) or 0
     return {"stats":{"total_leads":leads,"calls_today":calls_today,"answered":db.scalar(select(func.count()).select_from(Call).where(Call.answered_at.is_not(None))) or 0,"interested":statuses.get("INTERESTED",0),"hot_leads":statuses.get("HOT_LEAD",0),"callbacks":statuses.get("CALLBACK",0),"no_answer":statuses.get("NO_ANSWER",0)},"recent_calls":[CallOut.model_validate(c) for c in calls],"callbacks":[CallbackOut.model_validate(c) for c in callbacks]}
 
 @router.post("/leads/import", dependencies=[Depends(require_user)])
@@ -85,13 +92,39 @@ async def import_leads(file: UploadFile=File(...), db: Session=Depends(get_db)):
         except UnicodeDecodeError: raise HTTPException(400,"File must be UTF-8 or CP1251 text")
     return import_txt(db,text)
 
-@router.get("/leads", response_model=list[LeadOut], dependencies=[Depends(require_user)])
-def leads(status: str|None=None,campaign: int|None=None,search: str|None=None,db: Session=Depends(get_db)):
-    q=select(Lead)
-    if status: q=q.where(Lead.status==status)
-    if campaign: q=q.join(CampaignLead,CampaignLead.lead_id==Lead.id).where(CampaignLead.campaign_id==campaign)
-    if search: q=q.where(or_(Lead.phone.contains(search),Lead.company.contains(search)))
-    return db.scalars(q.order_by(Lead.id.desc())).unique().all()
+@router.get("/leads", response_model=LeadPageOut, dependencies=[Depends(require_user)])
+def leads(
+    status: str|None=None,
+    campaign: int|None=None,
+    search: str|None=Query(default=None,max_length=120),
+    page: int=Query(default=1,ge=1),
+    page_size: int=Query(default=25,ge=1,le=100),
+    sort_by: Literal["id","name","company","phone","status","attempts","next_call_at","last_call_at","created_at"]="id",
+    sort_order: Literal["asc","desc"]="desc",
+    db: Session=Depends(get_db),
+):
+    filters=[]
+    if status: filters.append(Lead.status==status)
+    if campaign:
+        campaign_membership=select(CampaignLead.id).where(CampaignLead.campaign_id==campaign,CampaignLead.lead_id==Lead.id).exists()
+        filters.append(campaign_membership)
+    query=(search or "").strip()
+    if query:
+        if S.database_url.startswith("sqlite"):
+            normalized=query.casefold()
+            filters.append(or_(func.app_casefold(Lead.phone).contains(normalized,autoescape=True),func.app_casefold(Lead.company).contains(normalized,autoescape=True),func.app_casefold(Lead.name).contains(normalized,autoescape=True)))
+        else:
+            escaped=query.replace("\\","\\\\").replace("%","\\%").replace("_","\\_")
+            pattern=f"%{escaped}%"
+            filters.append(or_(Lead.phone.ilike(pattern,escape="\\"),Lead.company.ilike(pattern,escape="\\"),Lead.name.ilike(pattern,escape="\\")))
+    total=db.scalar(select(func.count()).select_from(Lead).where(*filters)) or 0
+    sort_column=getattr(Lead,sort_by)
+    ordering=sort_column.asc().nulls_last() if sort_order=="asc" else sort_column.desc().nulls_last()
+    statement=select(Lead).where(*filters).order_by(ordering)
+    if sort_by!="id": statement=statement.order_by(Lead.id.desc())
+    items=db.scalars(statement.offset((page-1)*page_size).limit(page_size)).all()
+    page_count=max(1,(total+page_size-1)//page_size)
+    return {"items":items,"total":total,"page":page,"page_size":page_size,"page_count":page_count}
 
 @router.get("/leads/{lead_id}", dependencies=[Depends(require_user)])
 def lead_details(lead_id:int,db: Session=Depends(get_db)):
@@ -125,17 +158,26 @@ def schedule_callback(lead_id:int,req:CallbackCreate,db:Session=Depends(get_db))
 async def call_now(lead_id:int,db:Session=Depends(get_db)):
     lead=db.get(Lead,lead_id)
     if not lead: raise HTTPException(404,"Lead not found")
-    if lead.status=="DO_NOT_CALL": raise HTTPException(409,"Lead is DO_NOT_CALL")
-    c=await initiate_call(db,lead,None); db.refresh(c); return c
+    try:
+        c=await initiate_call(db,lead,None)
+    except CallNotEligibleError as error:
+        raise HTTPException(409,str(error)) from error
+    db.refresh(c); return c
 
 @router.get("/campaigns", dependencies=[Depends(require_user)])
 def campaigns(db:Session=Depends(get_db)):
+    campaign_rows=db.scalars(select(Campaign).order_by(Campaign.id.desc())).all()
+    status_rows=db.execute(select(CampaignLead.campaign_id,Lead.status,func.count()).join(Lead,Lead.id==CampaignLead.lead_id).group_by(CampaignLead.campaign_id,Lead.status)).all()
+    answered_rows=db.execute(select(Call.campaign_id,func.count()).where(Call.campaign_id.is_not(None),Call.answered_at.is_not(None)).group_by(Call.campaign_id)).all()
+    stats_by_campaign={}
+    for campaign_id,status,count in status_rows:
+        stats_by_campaign.setdefault(campaign_id,{})[status]=count
+    answered_by_campaign=dict(answered_rows)
     out=[]
-    for c in db.scalars(select(Campaign).order_by(Campaign.id.desc())).all():
-        stats=dict(db.execute(select(Lead.status,func.count()).join(CampaignLead,CampaignLead.lead_id==Lead.id).where(CampaignLead.campaign_id==c.id).group_by(Lead.status)).all())
+    for campaign in campaign_rows:
+        stats=stats_by_campaign.get(campaign.id,{})
         total=sum(stats.values())
-        answered=db.scalar(select(func.count()).select_from(Call).where(Call.campaign_id==c.id, Call.answered_at.is_not(None))) or 0
-        out.append({**CampaignOut.model_validate(c).model_dump(),"metrics":{"total":total,"queued":stats.get("QUEUED",0)+stats.get("NEW",0),"calling":stats.get("CALLING",0),"answered":answered,"no_answer":stats.get("NO_ANSWER",0),"interested":stats.get("INTERESTED",0),"hot_leads":stats.get("HOT_LEAD",0),"callbacks":stats.get("CALLBACK",0)}})
+        out.append({**CampaignOut.model_validate(campaign).model_dump(),"metrics":{"total":total,"queued":stats.get("QUEUED",0)+stats.get("NEW",0),"calling":stats.get("CALLING",0),"answered":answered_by_campaign.get(campaign.id,0),"no_answer":stats.get("NO_ANSWER",0),"interested":stats.get("INTERESTED",0),"hot_leads":stats.get("HOT_LEAD",0),"callbacks":stats.get("CALLBACK",0)}})
     return out
 
 @router.post("/campaigns", response_model=CampaignOut, dependencies=[Depends(require_user)])
@@ -145,13 +187,21 @@ def create_campaign(req:CampaignCreate,db:Session=Depends(get_db)):
 @router.post("/campaigns/{campaign_id}/attach-all", dependencies=[Depends(require_user)])
 def attach_all(campaign_id:int,db:Session=Depends(get_db)):
     if not db.get(Campaign,campaign_id): raise HTTPException(404,"Campaign not found")
-    added=0
-    existing=set(db.scalars(select(CampaignLead.lead_id).where(CampaignLead.campaign_id==campaign_id)).all())
-    for lead in db.scalars(select(Lead).where(Lead.status!="DO_NOT_CALL")).all():
-        if lead.id not in existing:
-            db.add(CampaignLead(campaign_id=campaign_id,lead_id=lead.id)); added+=1
-            if lead.status=="NEW": lead.status="QUEUED"
+    existing=select(CampaignLead.id).where(CampaignLead.campaign_id==campaign_id,CampaignLead.lead_id==Lead.id).exists()
+    source=select(literal(campaign_id),Lead.id).where(Lead.status.in_(["NEW","QUEUED","CALLBACK"]),~existing)
+    result=db.execute(sqlite_insert(CampaignLead).from_select(["campaign_id","lead_id"],source).on_conflict_do_nothing(index_elements=["campaign_id","lead_id"]))
+    db.execute(update(Lead).where(Lead.status=="NEW",Lead.id.in_(select(CampaignLead.lead_id).where(CampaignLead.campaign_id==campaign_id))).values(status="QUEUED"))
+    added=max(result.rowcount or 0,0)
     db.commit(); return {"attached":added}
+
+@router.get("/campaigns/{campaign_id}/audience", dependencies=[Depends(require_user)])
+def campaign_audience(campaign_id:int,db:Session=Depends(get_db)):
+    if not db.get(Campaign,campaign_id): raise HTTPException(404,"Campaign not found")
+    existing=select(CampaignLead.id).where(CampaignLead.campaign_id==campaign_id,CampaignLead.lead_id==Lead.id).exists()
+    by_status=dict(db.execute(select(Lead.status,func.count()).where(Lead.status.in_(["NEW","QUEUED","CALLBACK"]),~existing).group_by(Lead.status)).all())
+    attached=db.scalar(select(func.count()).select_from(CampaignLead).where(CampaignLead.campaign_id==campaign_id)) or 0
+    attached_eligible=db.scalar(select(func.count()).select_from(CampaignLead).join(Lead,Lead.id==CampaignLead.lead_id).where(CampaignLead.campaign_id==campaign_id,Lead.status.in_(["NEW","QUEUED","CALLBACK"]))) or 0
+    return {"to_attach":sum(by_status.values()),"already_attached":attached,"attached_eligible":attached_eligible,"by_status":by_status}
 
 @router.post("/campaigns/{campaign_id}/start", response_model=CampaignOut, dependencies=[Depends(require_user)])
 def start_campaign(campaign_id:int,req:CampaignStart,db:Session=Depends(get_db)):
@@ -184,11 +234,8 @@ def calls(db:Session=Depends(get_db)):
 
 @router.get("/callbacks", dependencies=[Depends(require_user)])
 def callbacks(db:Session=Depends(get_db)):
-    rows=db.scalars(select(Callback).order_by(Callback.scheduled_at)).all()
-    out=[]
-    for cb in rows:
-        lead=db.get(Lead,cb.lead_id); out.append({**CallbackOut.model_validate(cb).model_dump(),"phone":lead.phone if lead else "","company":lead.company if lead else None})
-    return out
+    rows=db.execute(select(Callback,Lead.phone,Lead.company).join(Lead,Lead.id==Callback.lead_id).order_by(Callback.scheduled_at)).all()
+    return [{**CallbackOut.model_validate(callback).model_dump(),"phone":phone,"company":company} for callback,phone,company in rows]
 
 @router.patch("/callbacks/{callback_id}", response_model=CallbackOut, dependencies=[Depends(require_user)])
 def update_callback(callback_id:int,req:CallbackUpdate,db:Session=Depends(get_db)):
@@ -224,19 +271,28 @@ def update_callback(callback_id:int,req:CallbackUpdate,db:Session=Depends(get_db
 
 @router.get("/settings", dependencies=[Depends(require_user)])
 def settings(db:Session=Depends(get_db)):
-    defaults={"agent_name":"Алекс","company_name":"Веб-студия","what_we_sell":"Разработка сайтов, редизайн и автоматизация для бизнеса","introduction":"Добрый день! Можно задать короткий вопрос о вашем сайте?","offer":"Разработка и улучшение сайтов для бизнеса","allowed_claims":"Мы разрабатываем сайты и автоматизируем процессы.","forbidden_claims":"Не придумывать цены, кейсы, гарантии и сроки.","call_objective":"Понять интерес и договориться о следующем шаге.","max_response_length":"3","calling_hours":f"{S.calling_hours_start}-{S.calling_hours_end}","timezone":S.app_timezone,"max_attempts":str(S.max_attempts),"delay_between_attempts":str(S.retry_delay_minutes),"max_concurrent_calls":str(S.max_concurrent_calls),"vosk_model_path":S.vosk_model_path,"piper_model_path":S.piper_model_path,"llm_provider":S.llm_provider,"llm_model":S.codex_model,"reasoning_effort":S.codex_reasoning_effort}
-    stored={x.key:x.value for x in db.scalars(select(AppSetting)).all()}; defaults.update(stored)
-    return {"values":defaults,"providers":{"auth_mode":S.auth_mode,"llm_provider":S.llm_provider,"telephony_provider":S.telephony_provider,"stt_provider":S.stt_provider,"tts_provider":S.tts_provider,"vosk_model_path":S.vosk_model_path,"piper_model_path":S.piper_model_path,"codex_model":S.codex_model,"reasoning_effort":S.codex_reasoning_effort}}
+    llm_provider=runtime_setting("llm_provider",S.llm_provider)
+    llm_model=runtime_setting("llm_model",S.codex_model)
+    reasoning_effort=runtime_setting("reasoning_effort",S.codex_reasoning_effort)
+    vosk_model_path=runtime_setting("vosk_model_path",S.vosk_model_path)
+    piper_model_path=runtime_setting("piper_model_path",S.piper_model_path)
+    preferences=call_preferences(db)
+    defaults={"agent_name":"Алекс","company_name":"Веб-студия","what_we_sell":"Разработка сайтов, редизайн и автоматизация для бизнеса","introduction":"Добрый день! Можно задать короткий вопрос о вашем сайте?","offer":"Разработка и улучшение сайтов для бизнеса","allowed_claims":"Мы разрабатываем сайты и автоматизируем процессы.","forbidden_claims":"Не придумывать цены, кейсы, гарантии и сроки.","call_objective":"Понять интерес и договориться о следующем шаге.","max_response_length":"3","calling_hours":f"{preferences['start']}-{preferences['end']}","timezone":preferences['timezone'],"max_attempts":str(preferences['max_attempts']),"delay_between_attempts":str(preferences['retry_delay_minutes']),"max_concurrent_calls":str(preferences['max_concurrent_calls']),"vosk_model_path":vosk_model_path,"piper_model_path":piper_model_path,"llm_provider":llm_provider,"llm_model":llm_model,"reasoning_effort":reasoning_effort}
+    allowed=set(SettingsUpdate.model_fields)
+    stored={x.key:x.value for x in db.scalars(select(AppSetting).where(AppSetting.key.in_(allowed))).all()}; defaults.update(stored)
+    defaults.update({"calling_hours":f"{preferences['start']}-{preferences['end']}","timezone":preferences['timezone'],"max_attempts":str(preferences['max_attempts']),"delay_between_attempts":str(preferences['retry_delay_minutes']),"max_concurrent_calls":str(preferences['max_concurrent_calls'])})
+    return {"values":defaults,"providers":{"auth_mode":S.auth_mode,"llm_provider":llm_provider,"telephony_provider":S.telephony_provider,"stt_provider":S.stt_provider,"tts_provider":S.tts_provider,"vosk_model_path":vosk_model_path,"piper_model_path":piper_model_path,"codex_model":llm_model,"reasoning_effort":reasoning_effort}}
 
 @router.put("/settings", dependencies=[Depends(require_user)])
-def save_settings(values:dict,db:Session=Depends(get_db)):
-    forbidden={"twilio_auth_token","openai_oauth_client_secret","jwt_secret"}
-    for k,v in values.items():
-        if k in forbidden: continue
+def save_settings(values:SettingsUpdate,db:Session=Depends(get_db)):
+    updates=values.model_dump(exclude_unset=True,exclude_none=True)
+    for k,v in updates.items():
         row=db.get(AppSetting,k)
         if not row: row=AppSetting(key=k,value=str(v)); db.add(row)
         else: row.value=str(v)
-    db.commit(); return {"ok":True}
+    db.commit()
+    invalidate_runtime_providers(set(updates))
+    return {"ok":True}
 
 @router.get("/providers/health", dependencies=[Depends(require_user)])
 async def providers_health():
@@ -253,8 +309,16 @@ def twiml(call_id:int):
 def twilio_status(call_id:int, CallStatus:str=Form(default=""), CallSid:str=Form(default=""), db:Session=Depends(get_db)):
     c=db.get(Call,call_id)
     if c:
+        terminal_statuses={"COMPLETED","FAILED","BUSY","NO_ANSWER","CANCELED"}
+        was_finalized=c.ended_at is not None and c.status in terminal_statuses and c.result!="provider_error"
+        c.twilio_call_sid=CallSid or c.twilio_call_sid
+        # Twilio may retry terminal webhook deliveries. Once a callback has
+        # finalized this call, later deliveries must not create another retry.
+        if was_finalized:
+            db.commit()
+            return Response(status_code=204)
         status=(CallStatus or "").lower()
-        c.twilio_call_sid=CallSid or c.twilio_call_sid; c.status=status.upper().replace("-","_") or c.status
+        c.status=status.upper().replace("-","_") or c.status
         lead=db.get(Lead,c.lead_id)
         if status in ("answered","in-progress") and not c.answered_at: c.answered_at=datetime.now(timezone.utc)
         if status in ("completed","failed","busy","no-answer","canceled"):
@@ -262,16 +326,22 @@ def twilio_status(call_id:int, CallStatus:str=Form(default=""), CallSid:str=Form
             if c.started_at:
                 started=c.started_at if c.started_at.tzinfo else c.started_at.replace(tzinfo=timezone.utc)
                 c.duration=max(0,int((c.ended_at-started).total_seconds()))
-            if lead and not c.result and lead.status != "DO_NOT_CALL":
+            c.result=status.upper().replace("-","_") if c.result=="provider_error" else (c.result or status.upper().replace("-","_"))
+            if lead and lead.status != "DO_NOT_CALL":
                 pref=call_preferences(db)
                 if status=="no-answer": lead.status="NO_ANSWER"; lead.result="No answer"
                 elif status=="busy": lead.status="BUSY"; lead.result="Busy"
                 elif status in ("failed","canceled"): lead.status="FAILED"; lead.result=status
                 elif status=="completed": lead.status="DONE"; lead.result=lead.result or "completed"
-                if status in ("no-answer","busy","failed") and lead.attempts < pref["max_attempts"]:
+                if status in ("no-answer","busy","failed"):
                     from datetime import timedelta
-                    lead.status="CALLBACK"; lead.next_call_at=datetime.now(timezone.utc)+timedelta(minutes=pref["retry_delay_minutes"])
-                    db.add(Callback(lead_id=lead.id,call_id=c.id,reason=f"Automatic retry after {status}",scheduled_at=lead.next_call_at))
+                    active_callback=db.scalars(select(Callback).where(Callback.lead_id==lead.id,Callback.status.in_(["SCHEDULED","DUE"])).order_by(Callback.scheduled_at).limit(1)).first()
+                    if active_callback:
+                        lead.status="CALLBACK"
+                        lead.next_call_at=active_callback.scheduled_at
+                    elif lead.attempts < pref["max_attempts"]:
+                        lead.status="CALLBACK"; lead.next_call_at=datetime.now(timezone.utc)+timedelta(minutes=pref["retry_delay_minutes"])
+                        db.add(Callback(lead_id=lead.id,call_id=c.id,reason=f"Automatic retry after {status}",scheduled_at=lead.next_call_at))
         db.commit()
     return Response(status_code=204)
 

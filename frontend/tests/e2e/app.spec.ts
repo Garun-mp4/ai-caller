@@ -85,9 +85,21 @@ async function mockApi(page: Page, options: { invalidLogin?: boolean } = {}): Pr
     if (path === '/leads' && method === 'GET') {
       const status = url.searchParams.get('status');
       const query = (url.searchParams.get('search') || '').toLocaleLowerCase('ru-RU');
-      let filtered = leads.filter(lead => (!status || lead.status === status) && (!query || `${lead.company || ''} ${lead.phone}`.toLocaleLowerCase('ru-RU').includes(query)));
+      let filtered = leads.filter(lead => (!status || lead.status === status) && (!query || `${lead.name || ''} ${lead.company || ''} ${lead.phone}`.toLocaleLowerCase('ru-RU').includes(query)));
       if (url.searchParams.get('campaign')) filtered = filtered.filter(lead => lead.id !== 44);
-      return fulfillJson(route, filtered);
+      const sortBy = url.searchParams.get('sort_by') || 'id';
+      const sortOrder = url.searchParams.get('sort_order') === 'asc' ? 1 : -1;
+      filtered.sort((left, right) => {
+        const a = left[sortBy as keyof LeadMock];
+        const b = right[sortBy as keyof LeadMock];
+        const compared = typeof a === 'number' && typeof b === 'number' ? a - b : String(a || '').localeCompare(String(b || ''), 'ru-RU');
+        return compared * sortOrder || right.id - left.id;
+      });
+      const total = filtered.length;
+      const pageNumber = Number(url.searchParams.get('page') || 1);
+      const pageSize = Number(url.searchParams.get('page_size') || 25);
+      const pageCount = Math.max(1, Math.ceil(total / pageSize));
+      return fulfillJson(route, { items: filtered.slice((pageNumber - 1) * pageSize, pageNumber * pageSize), total, page: pageNumber, page_size: pageSize, page_count: pageCount });
     }
     const leadMatch = path.match(/^\/leads\/(\d+)$/);
     if (leadMatch && method === 'GET') {
@@ -127,6 +139,8 @@ async function mockApi(page: Page, options: { invalidLogin?: boolean } = {}): Pr
       const item: CampaignMock = { id: campaigns.length + 1, name: String(body.name || ''), description: String(body.description || ''), agent_prompt: String(body.agent_prompt || ''), status: 'DRAFT', metrics: { total: 0, queued: 0, calling: 0, answered: 0, no_answer: 0, interested: 0, hot_leads: 0 } };
       campaigns.unshift(item); return fulfillJson(route, item);
     }
+    const audienceMatch = path.match(/^\/campaigns\/(\d+)\/audience$/);
+    if (audienceMatch && method === 'GET') return fulfillJson(route, { to_attach: 2, already_attached: 0, attached_eligible: 0, by_status: { NEW: 2 } });
     const campaignAction = path.match(/^\/campaigns\/(\d+)\/(attach-all|start|pause|stop)$/);
     if (campaignAction && method === 'POST') {
       const campaign = campaigns.find(item => item.id === Number(campaignAction[1]));
@@ -205,7 +219,15 @@ test('leads can be searched, filtered, imported, and paged without losing Russia
   await page.goto('/leads');
   await expect(page.getByRole('link', { name: 'Альфа' })).toBeVisible();
   await expect(page.getByRole('cell', { name: 'Есть интерес' })).toBeVisible();
-  const search = page.getByPlaceholder('Компания или телефон');
+  expect(mocks.requests.some(request => request.path === '/leads' && request.search.includes('page=1') && request.search.includes('page_size=25'))).toBe(true);
+  const companyHeader = page.getByRole('columnheader', { name: /Компания \/ контакт/ });
+  await companyHeader.getByRole('button').click();
+  await expect(companyHeader).toHaveAttribute('aria-sort', 'ascending');
+  expect(mocks.requests.some(request => request.path === '/leads' && request.search.includes('sort_by=company') && request.search.includes('sort_order=asc'))).toBe(true);
+  const search = page.getByPlaceholder('Имя, компания или телефон');
+  await search.fill('Анна');
+  await search.press('Enter');
+  await expect(page.getByRole('link', { name: 'Альфа' })).toBeVisible();
   await search.fill('Бета');
   await search.press('Enter');
   await expect(page.getByRole('link', { name: 'Бета' })).toBeVisible();
@@ -237,11 +259,11 @@ test('lead details save notes, schedule a callback, confirm a call, and protect 
   await expect(page.getByRole('heading', { name: 'Альфа' })).toBeVisible();
   await page.getByLabel('Заметки').fill('Договорились вернуться в понедельник');
   await page.getByRole('button', { name: 'Сохранить заметки' }).click();
-  await expect(page.getByRole('status')).toContainText('Заметки сохранены');
+  await expect(page.getByRole('status').filter({ hasText: 'Заметки сохранены' })).toBeVisible();
 
   await page.getByRole('button', { name: 'Назначить звонок' }).click();
   await page.getByRole('button', { name: 'Запланировать', exact: true }).click();
-  await expect(page.getByRole('status')).toContainText('Обратный звонок запланирован');
+  await expect(page.getByRole('status').filter({ hasText: 'Обратный звонок запланирован' })).toBeVisible();
   expect(mocks.requests.some(request => request.path === '/leads/42/callback' && request.method === 'POST')).toBe(true);
 
   await page.getByRole('button', { name: 'Позвонить' }).click();
@@ -251,7 +273,7 @@ test('lead details save notes, schedule a callback, confirm a call, and protect 
   await page.getByRole('button', { name: 'Позвонить' }).click();
   await expect(page.getByRole('dialog')).toContainText('Проверьте номер перед запуском.');
   await page.getByRole('button', { name: 'Начать звонок' }).click();
-  await expect(page.getByRole('status')).toContainText('Звонок добавлен');
+  await expect(page.getByRole('status').filter({ hasText: 'Звонок добавлен' })).toBeVisible();
 
   await page.getByRole('button', { name: 'Не звонить' }).click();
   await page.getByRole('button', { name: 'Включить запрет' }).click();
@@ -267,7 +289,7 @@ test('callbacks can be rescheduled, completed, and canceled', async ({ page }) =
   await expect(page.getByRole('link', { name: 'Альфа' })).toBeVisible();
   await page.getByRole('button', { name: 'Перенести обратный звонок #5' }).click();
   await page.getByRole('button', { name: 'Сохранить время' }).click();
-  await expect(page.getByRole('status')).toContainText('Новое время сохранено');
+  await expect(page.getByRole('status').filter({ hasText: 'Новое время сохранено' })).toBeVisible();
   expect(mocks.requests.some(request => request.path === '/callbacks/5' && request.method === 'PATCH' && request.body?.scheduled_at)).toBe(true);
 
   await page.getByRole('button', { name: 'Отметить обратный звонок #5 выполненным' }).click();
@@ -291,6 +313,8 @@ test('campaign creation requires compliance before start and confirms scheduler 
   await expect(campaignCard).toBeVisible();
   const start = campaignCard.getByRole('button', { name: 'Запустить' });
   await expect(start).toBeDisabled();
+  await campaignCard.getByRole('button', { name: 'Проверить аудиторию' }).click();
+  await expect(campaignCard.getByText(/К добавлению: 2/)).toBeVisible();
   await campaignCard.getByRole('checkbox').check();
   await expect(start).toBeEnabled();
   await start.click();
@@ -332,7 +356,7 @@ test('settings save changes and display provider health as clear statuses', asyn
   const save = page.getByRole('button', { name: 'Сохранить изменения' });
   await expect(save).toBeEnabled();
   await save.click();
-  await expect(page.getByRole('status')).toContainText('Настройки сохранены');
+  await expect(page.getByRole('status').filter({ hasText: 'Настройки сохранены' })).toBeVisible();
   expect(mocks.settings.values.agent_name).toBe('Наталья');
   await expect(page.getByText('Доступен').first()).toBeVisible();
 });

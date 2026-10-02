@@ -1,6 +1,6 @@
 from __future__ import annotations
 from datetime import datetime, timezone
-from sqlalchemy import String, Integer, DateTime, Text, ForeignKey, Float, Boolean, UniqueConstraint
+from sqlalchemy import String, Integer, DateTime, Text, ForeignKey, Float, Boolean, UniqueConstraint, Index
 from sqlalchemy.orm import Mapped, mapped_column, relationship
 from app.db.base import Base
 
@@ -9,6 +9,7 @@ def utcnow():
 
 class Lead(Base):
     __tablename__ = "leads"
+    __table_args__ = (Index("ix_leads_status_next_call_at", "status", "next_call_at"),)
     id: Mapped[int] = mapped_column(primary_key=True)
     phone: Mapped[str] = mapped_column(String(32), unique=True, index=True)
     name: Mapped[str | None] = mapped_column(String(200), nullable=True)
@@ -46,6 +47,11 @@ class CampaignLead(Base):
 
 class Call(Base):
     __tablename__ = "calls"
+    __table_args__ = (
+        Index("ix_calls_status_started_at", "status", "started_at"),
+        Index("ix_calls_lead_status", "lead_id", "status"),
+        Index("ix_calls_started_at", "started_at"),
+    )
     id: Mapped[int] = mapped_column(primary_key=True)
     lead_id: Mapped[int] = mapped_column(ForeignKey("leads.id"), index=True)
     campaign_id: Mapped[int | None] = mapped_column(ForeignKey("campaigns.id"), nullable=True, index=True)
@@ -77,6 +83,7 @@ class TranscriptMessage(Base):
 
 class Callback(Base):
     __tablename__ = "callbacks"
+    __table_args__ = (Index("ix_callbacks_status_scheduled_at", "status", "scheduled_at"),)
     id: Mapped[int] = mapped_column(primary_key=True)
     lead_id: Mapped[int] = mapped_column(ForeignKey("leads.id"), index=True)
     call_id: Mapped[int | None] = mapped_column(ForeignKey("calls.id"), nullable=True)

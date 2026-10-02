@@ -114,6 +114,8 @@ export function friendlyError(error: unknown) {
     'Invalid credentials': 'Логин или пароль указаны неверно.',
     'Local login disabled': 'Локальный вход отключён в настройках сервера.',
     'Lead is DO_NOT_CALL': 'Для этого контакта запрещены звонки.',
+    'Lead already has an active call': 'У этого контакта уже есть активный звонок.',
+    'Maximum concurrent calls reached': 'Достигнут лимит одновременных звонков. Повторите попытку после освобождения линии.',
     'Compliance confirmation is required': 'Подтвердите право связываться с лидами перед запуском.',
     'Only TXT files are allowed': 'Для импорта выберите файл в формате TXT.',
     'TXT file is too large': 'Файл слишком большой. Разделите его на несколько файлов.',
@@ -122,7 +124,9 @@ export function friendlyError(error: unknown) {
     'Campaign not found': 'Кампания не найдена. Обновите список.',
     'Callback not found': 'Обратный звонок не найден. Обновите список.',
   };
-  return translations[message] || 'Не удалось выполнить запрос. Проверьте соединение с сервером и попробуйте ещё раз.';
+  if (translations[message]) return translations[message];
+  if (error && typeof error === 'object' && 'status' in error && error.status === 422) return 'Проверьте формат и допустимый диапазон значений.';
+  return 'Не удалось выполнить запрос. Проверьте соединение с сервером и попробуйте ещё раз.';
 }
 
 export function localDateTimeValue(date: Date) {
